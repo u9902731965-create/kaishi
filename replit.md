@@ -40,6 +40,20 @@ python filename.py
 Or update the workflow configuration to run your preferred script.
 
 ## Recent Changes
+- 2025-11-02:
+  - **Web查账系统上线**（完整版）:
+    - Flask Web应用提供可视化查账界面
+    - 功能：交易记录查询、日期筛选、操作员统计、数据可视化
+    - 安全认证：HMAC-SHA256 Token，24小时有效期
+    - 交易回退功能（仅OWNER权限）
+    - 响应式UI设计，支持手机/平板/电脑
+    - Bot集成：所有账单消息附带"📊 查看账单明细"按钮
+    - 安全修复：强制要求SESSION_SECRET环境变量
+    - 技术栈：Flask + Bootstrap 5 + Vanilla JS
+    - 部署：Docker多进程启动（Bot + Web应用）
+    - 新增文件：web_app.py, templates/, static/, start.sh
+    - 新增依赖：Flask==3.0.0
+    - 新增文档：CLAWCLOUD_WEB_DEPLOY.md, WEB_DASHBOARD_GUIDE.md
 - 2025-11-01:
   - **ClawCloud Run deployment support added**:
     - Created Dockerfile for containerized deployment

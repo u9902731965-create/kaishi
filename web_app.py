@@ -15,13 +15,21 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for, s
 from functools import wraps
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SESSION_SECRET", "your-secret-key-change-in-production")
 
-# 配置
+# 配置 - 强制要求SESSION_SECRET
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+if not SESSION_SECRET:
+    raise RuntimeError(
+        "❌ 安全错误：SESSION_SECRET环境变量未设置！\n"
+        "这是Web查账系统的加密密钥，必须设置强随机字符串。\n"
+        "示例：export SESSION_SECRET=$(openssl rand -hex 32)"
+    )
+
+app.secret_key = SESSION_SECRET
+TOKEN_SECRET = SESSION_SECRET
 OWNER_ID = int(os.getenv("OWNER_ID", "7784416293"))
 DATA_DIR = Path("./data")
 GROUPS_DIR = DATA_DIR / "groups"
-TOKEN_SECRET = os.getenv("SESSION_SECRET", "your-secret-key-change-in-production")
 
 # ========== Token认证系统 ==========
 

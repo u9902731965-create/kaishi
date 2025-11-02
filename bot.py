@@ -10,7 +10,13 @@ import requests
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID  = os.getenv("OWNER_ID")  # 可选：你的 Telegram ID（字符串），拥有永久管理员权限
-SESSION_SECRET = os.getenv("SESSION_SECRET", "your-secret-key-change-in-production")
+
+# Web查账系统配置
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+if not SESSION_SECRET:
+    print("⚠️  警告：SESSION_SECRET未设置，Web查账按钮将不可用")
+    print("   如需使用Web查账功能，请设置：export SESSION_SECRET=$(openssl rand -hex 32)")
+    SESSION_SECRET = None  # 标记为未配置
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://localhost:5000")  # Web应用的基础URL
 
 # ========== 记账核心状态（多群组支持）==========
@@ -397,12 +403,16 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
     """发送带Web查账按钮的汇总消息"""
     summary_text = render_group_summary(chat_id)
-    web_url = generate_web_url(chat_id, user_id)
     
-    keyboard = [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(summary_text, reply_markup=reply_markup)
+    # 仅在SESSION_SECRET配置时显示Web查账按钮
+    if SESSION_SECRET:
+        web_url = generate_web_url(chat_id, user_id)
+        keyboard = [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(summary_text, reply_markup=reply_markup)
+    else:
+        # 未配置SESSION_SECRET时，只发送纯文本汇总
+        await update.message.reply_text(summary_text)
 
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """检查用户是否是群组管理员或群主"""
