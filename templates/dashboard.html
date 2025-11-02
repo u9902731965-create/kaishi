@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>账单查询系统</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-primary mb-4">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0 h1">
+                <i class="bi bi-wallet2"></i> 账单查询系统
+            </span>
+            <span class="text-white">
+                {% if is_owner %}
+                <span class="badge bg-warning text-dark">管理员</span>
+                {% endif %}
+            </span>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- 筛选面板 -->
+        <div class="card mb-4">
+            <div class="card-header bg-light">
+                <i class="bi bi-funnel"></i> 筛选条件
+            </div>
+            <div class="card-body">
+                <form id="filterForm" class="row g-3">
+                    <div class="col-md-4">
+                        <label for="startDate" class="form-label">开始日期</label>
+                        <input type="date" class="form-control" id="startDate" name="start_date">
+                    </div>
+                    <div class="col-md-4">
+                        <label for="endDate" class="form-label">结束日期</label>
+                        <input type="date" class="form-control" id="endDate" name="end_date">
+                    </div>
+                    <div class="col-md-4 d-flex align-items-end">
+                        <button type="submit" class="btn btn-primary me-2">
+                            <i class="bi bi-search"></i> 查询
+                        </button>
+                        <button type="button" class="btn btn-secondary" id="resetBtn">
+                            <i class="bi bi-arrow-clockwise"></i> 重置
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- 统计面板 -->
+        <div class="row mb-4" id="statsPanel">
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <h6 class="card-title text-muted">总入金</h6>
+                        <h3 class="text-success" id="totalDeposit">0</h3>
+                        <small class="text-muted" id="totalDepositUSDT">0 USDT</small>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <h6 class="card-title text-muted">总出金</h6>
+                        <h3 class="text-danger" id="totalWithdrawal">0</h3>
+                        <small class="text-muted" id="totalWithdrawalUSDT">0 USDT</small>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <h6 class="card-title text-muted">已下发</h6>
+                        <h3 class="text-info" id="totalDisbursement">0 USDT</h3>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <h6 class="card-title text-muted">应下发</h6>
+                        <h3 class="text-warning" id="pendingDisbursement">0 USDT</h3>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 当前配置 -->
+        <div class="card mb-4">
+            <div class="card-header bg-light">
+                <i class="bi bi-gear"></i> 当前配置
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3">
+                        <strong>入金费率:</strong> {{ config.deposit_fee_rate }}%
+                    </div>
+                    <div class="col-md-3">
+                        <strong>入金汇率:</strong> {{ config.deposit_fx }}
+                    </div>
+                    <div class="col-md-3">
+                        <strong>出金费率:</strong> {{ config.withdrawal_fee_rate }}%
+                    </div>
+                    <div class="col-md-3">
+                        <strong>出金汇率:</strong> {{ config.withdrawal_fx }}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 交易记录表格 -->
+        <div class="card mb-4">
+            <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-list-ul"></i> 交易记录</span>
+                <span class="badge bg-primary" id="recordCount">0 条记录</span>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover table-striped">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>时间</th>
+                                <th>类型</th>
+                                <th>金额</th>
+                                <th>费率</th>
+                                <th>汇率</th>
+                                <th>USDT</th>
+                                <th>操作员</th>
+                                {% if is_owner %}
+                                <th>操作</th>
+                                {% endif %}
+                            </tr>
+                        </thead>
+                        <tbody id="transactionTable">
+                            <tr>
+                                <td colspan="{% if is_owner %}8{% else %}7{% endif %}" class="text-center text-muted">
+                                    加载中...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 按操作员统计 -->
+        <div class="card mb-4">
+            <div class="card-header bg-light">
+                <i class="bi bi-person-lines-fill"></i> 按操作员统计
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm">
+                        <thead>
+                            <tr>
+                                <th>操作员</th>
+                                <th>入金笔数</th>
+                                <th>入金USDT</th>
+                                <th>出金笔数</th>
+                                <th>出金USDT</th>
+                                <th>下发笔数</th>
+                                <th>下发USDT</th>
+                            </tr>
+                        </thead>
+                        <tbody id="operatorTable">
+                            <tr>
+                                <td colspan="7" class="text-center text-muted">暂无数据</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 回退确认对话框 -->
+    <div class="modal fade" id="rollbackModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-danger text-white">
+                    <h5 class="modal-title">
+                        <i class="bi bi-exclamation-triangle"></i> 确认回退
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p>确定要回退这笔交易吗？</p>
+                    <div id="rollbackInfo"></div>
+                    <div class="alert alert-warning mt-3">
+                        <i class="bi bi-info-circle"></i> 此操作不可撤销！
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-danger" id="confirmRollback">确认回退</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const IS_OWNER = {{ 'true' if is_owner else 'false' }};
+        let currentRollbackData = null;
+    </script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

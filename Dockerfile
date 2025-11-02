@@ -14,11 +14,16 @@ COPY . .
 # 创建数据目录
 RUN mkdir -p /app/data/groups /app/data/logs/private_chats
 
-# 暴露端口（用于健康检查）
-EXPOSE 10000
+# 复制启动脚本
+COPY start.sh .
+RUN chmod +x start.sh
 
-# 设置环境变量（默认端口）
+# 暴露端口
+EXPOSE 10000 5000
+
+# 设置环境变量
 ENV PORT=10000
+ENV WEB_PORT=5000
 
-# 运行bot
-CMD ["python", "bot.py"]
+# 运行启动脚本（同时启动Bot和Web应用）
+CMD ["./start.sh"]

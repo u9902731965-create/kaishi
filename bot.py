@@ -1,5 +1,6 @@
 # bot.py
-import os, re, threading, json, math, datetime
+import os, re, threading, json, math, datetime, hmac, hashlib
+from datetime import timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -9,6 +10,8 @@ import requests
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID  = os.getenv("OWNER_ID")  # 可选：你的 Telegram ID（字符串），拥有永久管理员权限
+SESSION_SECRET = os.getenv("SESSION_SECRET", "your-secret-key-change-in-production")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://localhost:5000")  # Web应用的基础URL
 
 # ========== 记账核心状态（多群组支持）==========
 DATA_DIR = Path("./data")
@@ -242,6 +245,24 @@ def list_admins():
     """获取管理员列表"""
     return load_admins()
 
+# ========== Web查账Token生成 ==========
+def generate_web_token(chat_id: int, user_id: int, expires_hours: int = 24):
+    """生成Web查账访问token"""
+    from datetime import datetime
+    expires_at = int((datetime.now() + timedelta(hours=expires_hours)).timestamp())
+    data = f"{chat_id}:{user_id}:{expires_at}"
+    signature = hmac.new(
+        SESSION_SECRET.encode(),
+        data.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{data}:{signature}"
+
+def generate_web_url(chat_id: int, user_id: int):
+    """生成Web查账访问URL"""
+    token = generate_web_token(chat_id, user_id)
+    return f"{WEB_BASE_URL}/dashboard?token={token}"
+
 # ========== 群内汇总显示 ==========
 def render_group_summary(chat_id: int) -> str:
     state = load_group_state(chat_id)
@@ -370,8 +391,18 @@ def render_full_summary(chat_id: int) -> str:
     return "\n".join(lines)
 
 # ========== Telegram ==========
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+
+async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
+    """发送带Web查账按钮的汇总消息"""
+    summary_text = render_group_summary(chat_id)
+    web_url = generate_web_url(chat_id, user_id)
+    
+    keyboard = [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(summary_text, reply_markup=reply_markup)
 
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """检查用户是否是群组管理员或群主"""
@@ -689,7 +720,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_group_state(chat_id)
             append_log(log_path(chat_id, None, dstr), f"[撤销入金] 时间:{ts} 原金额:{raw_amt} USDT:{usdt_amt} 标记:无效操作")
             await update.message.reply_text(f"✅ 已撤销入金记录\n📊 原金额：+{raw_amt} → {usdt_amt} USDT")
-            await update.message.reply_text(render_group_summary(chat_id))
+            await send_summary_with_button(update, chat_id, user.id)
             return
             
         elif out_match:
@@ -705,7 +736,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_group_state(chat_id)
             append_log(log_path(chat_id, None, dstr), f"[撤销下发] 时间:{ts} USDT:{usdt_amt} 标记:无效操作")
             await update.message.reply_text(f"✅ 已撤销下发记录\n📊 原金额：{usdt_amt} USDT")
-            await update.message.reply_text(render_group_summary(chat_id))
+            await send_summary_with_button(update, chat_id, user.id)
             return
         else:
             await update.message.reply_text("❌ 无法识别要撤销的操作\n💡 请回复包含入金或下发记录的账单消息")
@@ -713,7 +744,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 查看账单（+0 不记录）
     if text == "+0":
-        await update.message.reply_text(render_group_summary(chat_id))
+        await send_summary_with_button(update, chat_id, user.id)
         return
     
     # 管理员管理命令
@@ -1004,7 +1035,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_group_state(chat_id)
         append_log(log_path(chat_id, country, dstr),
                    f"[入金] 时间:{ts} 国家:{country or '通用'} 原始:{amt} 汇率:{p['fx']} 费率:{p['rate']*100:.2f}% 结果:{usdt}")
-        await update.message.reply_text(render_group_summary(chat_id))
+        await send_summary_with_button(update, chat_id, user.id)
         return
 
     # 出金
@@ -1025,7 +1056,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_group_state(chat_id)
         append_log(log_path(chat_id, country, dstr),
                    f"[出金] 时间:{ts} 国家:{country or '通用'} 原始:{amt} 汇率:{p['fx']} 费率:{p['rate']*100:.2f}% 下发:{usdt}")
-        await update.message.reply_text(render_group_summary(chat_id))
+        await send_summary_with_button(update, chat_id, user.id)
         return
 
     # 下发USDT（仅管理员）
@@ -1049,7 +1080,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 append_log(log_path(chat_id, None, dstr), f"[撤销下发] 时间:{ts} 金额:{usdt_abs} USDT")
             
             save_group_state(chat_id)
-            await update.message.reply_text(render_group_summary(chat_id))
+            await send_summary_with_button(update, chat_id, user.id)
         except ValueError:
             await update.message.reply_text("❌ 格式错误，请输入有效的数字\n例如：下发35.04 或 下发-35.04")
         return
