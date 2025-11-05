@@ -447,6 +447,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 '  （必须准确输入"撤销"二字）\n\n'
                 "⚙️ 快速设置（仅管理员）：\n"
                 "  重置默认值（一键设置推荐费率/汇率）\n"
+                "  清除数据（清除今日00:00至现在的所有数据）\n"
                 "  设置入金费率 10\n"
                 "  设置入金汇率 153\n"
                 "  设置出金费率 -2\n"
@@ -512,6 +513,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             '  （必须准确输入"撤销"二字）\n\n'
             "⚙️ 快速设置（仅管理员）：\n"
             "  重置默认值（一键设置推荐费率/汇率）\n"
+            "  清除数据（清除今日00:00至现在的所有数据）\n"
             "  设置入金费率 10\n"
             "  设置入金汇率 153\n"
             "  设置出金费率 -2\n"
@@ -921,6 +923,159 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • 费率：2%\n"
             "  • 汇率：137"
         )
+        return
+    
+    # 清除今日数据（从00:00到当前时间）
+    if text == "清除数据":
+        if not is_admin(user.id):
+            return  # 非管理员不回复
+        
+        # 获取今天00:00的时间戳
+        from datetime import datetime
+        import pytz
+        
+        beijing_tz = pytz.timezone('Asia/Shanghai')
+        now = datetime.now(beijing_tz)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # 统计清除前的数据
+        rec_in = state["recent"]["in"]
+        rec_out = state["recent"]["out"]
+        
+        # 分离下发记录和普通出金记录
+        normal_out = [r for r in rec_out if r.get('type') != '下发']
+        send_out = [r for r in rec_out if r.get('type') == '下发']
+        
+        # 统计要清除的记录数量
+        clear_in_count = 0
+        clear_out_count = 0
+        clear_send_count = 0
+        
+        # 统计清除的USDT金额
+        cleared_in_usdt = 0.0
+        cleared_out_usdt = 0.0
+        cleared_send_usdt = 0.0
+        
+        # 筛选并清除入金记录
+        new_in = []
+        for r in rec_in:
+            # 解析时间字符串 "🕐 14:30"
+            time_str = r.get('ts', '')
+            try:
+                # 提取时间部分，例如 "🕐 14:30" -> "14:30"
+                import re
+                time_match = re.search(r'(\d{1,2}:\d{2})', time_str)
+                if time_match:
+                    time_part = time_match.group(1)
+                    hour, minute = map(int, time_part.split(':'))
+                    record_time = today_start.replace(hour=hour, minute=minute)
+                    
+                    # 如果记录时间在今天00:00之后，标记清除
+                    if record_time >= today_start:
+                        clear_in_count += 1
+                        cleared_in_usdt += r.get('usdt', 0)
+                    else:
+                        new_in.append(r)
+                else:
+                    # 无法解析时间，保留记录
+                    new_in.append(r)
+            except:
+                # 解析失败，保留记录
+                new_in.append(r)
+        
+        # 筛选并清除出金记录（普通出金）
+        new_normal_out = []
+        for r in normal_out:
+            time_str = r.get('ts', '')
+            try:
+                import re
+                time_match = re.search(r'(\d{1,2}:\d{2})', time_str)
+                if time_match:
+                    time_part = time_match.group(1)
+                    hour, minute = map(int, time_part.split(':'))
+                    record_time = today_start.replace(hour=hour, minute=minute)
+                    
+                    if record_time >= today_start:
+                        clear_out_count += 1
+                        cleared_out_usdt += r.get('usdt', 0)
+                    else:
+                        new_normal_out.append(r)
+                else:
+                    new_normal_out.append(r)
+            except:
+                new_normal_out.append(r)
+        
+        # 筛选并清除下发记录
+        new_send_out = []
+        for r in send_out:
+            time_str = r.get('ts', '')
+            try:
+                import re
+                time_match = re.search(r'(\d{1,2}:\d{2})', time_str)
+                if time_match:
+                    time_part = time_match.group(1)
+                    hour, minute = map(int, time_part.split(':'))
+                    record_time = today_start.replace(hour=hour, minute=minute)
+                    
+                    if record_time >= today_start:
+                        clear_send_count += 1
+                        cleared_send_usdt += abs(r.get('usdt', 0))
+                    else:
+                        new_send_out.append(r)
+                else:
+                    new_send_out.append(r)
+            except:
+                new_send_out.append(r)
+        
+        # 合并出金和下发记录
+        new_out = new_normal_out + new_send_out
+        
+        # 更新state
+        state["recent"]["in"] = new_in
+        state["recent"]["out"] = new_out
+        
+        # 重新计算汇总数据
+        # 应下发 = 剩余入金USDT总和
+        # 已下发 = 剩余出金USDT总和 + 剩余下发USDT总和
+        total_in_usdt = sum(r.get('usdt', 0) for r in new_in)
+        total_out_usdt = sum(r.get('usdt', 0) for r in new_normal_out)
+        total_send_usdt = sum(abs(r.get('usdt', 0)) for r in new_send_out)
+        
+        state["summary"]["should_send_usdt"] = trunc2(total_in_usdt)
+        state["summary"]["sent_usdt"] = trunc2(total_out_usdt + total_send_usdt)
+        
+        save_group_state(chat_id)
+        
+        # 记录到日志
+        append_log(log_path(chat_id, None, dstr), 
+                   f"[清除数据] 时间:{ts} 清除入金:{clear_in_count}笔/{cleared_in_usdt:.2f}USDT "
+                   f"出金:{clear_out_count}笔/{cleared_out_usdt:.2f}USDT "
+                   f"下发:{clear_send_count}笔/{cleared_send_usdt:.2f}USDT")
+        
+        # 构建回复消息
+        total_cleared = clear_in_count + clear_out_count + clear_send_count
+        
+        if total_cleared == 0:
+            await update.message.reply_text(
+                "ℹ️ 今日00:00之后暂无数据\n"
+                "📊 无需清除"
+            )
+        else:
+            lines = [
+                "✅ 已清除今日数据（00:00至现在）\n",
+                f"📥 已入账：清除 {clear_in_count} 笔 ({cleared_in_usdt:.2f} USDT)",
+                f"📤 已出账：清除 {clear_out_count} 笔 ({cleared_out_usdt:.2f} USDT)",
+                f"💰 已下发：清除 {clear_send_count} 笔 ({cleared_send_usdt:.2f} USDT)\n",
+                "━━━━━━━━━━━━━━",
+                f"📊 重新计算后：",
+                f"  • 应下发：{total_in_usdt:.2f} USDT",
+                f"  • 已下发：{total_out_usdt + total_send_usdt:.2f} USDT",
+                f"  • 未下发：{total_in_usdt - total_out_usdt - total_send_usdt:.2f} USDT"
+            ]
+            await update.message.reply_text("\n".join(lines))
+        
+        # 显示更新后的账单
+        await send_summary_with_button(update, chat_id, user.id)
         return
     
     # 简化的设置命令
