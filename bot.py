@@ -401,7 +401,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
-    """发送带Web查账按钮的汇总消息"""
+    """发送带Web查账按钮的汇总消息，返回发送的消息对象"""
     summary_text = render_group_summary(chat_id)
     
     # 仅在SESSION_SECRET配置时显示Web查账按钮
@@ -409,10 +409,12 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
         web_url = generate_web_url(chat_id, user_id)
         keyboard = [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(summary_text, reply_markup=reply_markup)
+        msg = await update.message.reply_text(summary_text, reply_markup=reply_markup)
     else:
         # 未配置SESSION_SECRET时，只发送纯文本汇总
-        await update.message.reply_text(summary_text)
+        msg = await update.message.reply_text(summary_text)
+    
+    return msg
 
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """检查用户是否是群组管理员或群主"""
@@ -702,57 +704,107 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user.id):
             return  # 非管理员不回复
         
-        # 获取被回复的消息内容
-        replied_text = update.message.reply_to_message.text or ""
+        # 获取被回复消息的message_id
+        replied_msg_id = update.message.reply_to_message.message_id
         
-        # 尝试从消息中提取最近的入金或下发记录
-        import re
+        # 在所有记录中查找这个message_id
+        found_record = None
+        record_type = None
         
-        # 匹配所有入金记录: 🕐 14:30　+10000 → 58.82 USDT
-        in_matches = re.findall(r'🕐\s*(\d+:\d+)\s*　\+(\d+(?:\.\d+)?)\s*→\s*(\d+(?:\.\d+)?)\s*USDT', replied_text)
-        # 匹配所有下发记录: 🕐 14:30　35.04 USDT 或 🕐 14:30　-35.04 USDT
-        out_matches = re.findall(r'🕐\s*(\d+:\d+)\s*　(-?\d+(?:\.\d+)?)\s*USDT', replied_text)
+        # 搜索入金记录
+        for record in state["recent"]["in"]:
+            if record.get("msg_id") == replied_msg_id:
+                found_record = record
+                record_type = "in"
+                break
         
-        # 取最后一笔（最新的）记录
-        in_match = in_matches[-1] if in_matches else None
-        out_match = out_matches[-1] if out_matches else None
+        # 如果在入金中没找到，搜索出金/下发记录
+        if not found_record:
+            for record in state["recent"]["out"]:
+                if record.get("msg_id") == replied_msg_id:
+                    found_record = record
+                    record_type = "out"
+                    break
         
-        if in_match:
-            # 撤销入金
-            raw_amt = trunc2(float(in_match[1]))
-            usdt_amt = trunc2(float(in_match[2]))
-            
-            # 反向操作：减少应下发
-            state["summary"]["should_send_usdt"] = trunc2(state["summary"]["should_send_usdt"] - usdt_amt)
-            save_group_state(chat_id)
-            
-            # 从最近记录中移除（如果存在）
-            state["recent"]["in"] = [r for r in state["recent"]["in"] if not (r.get("raw") == raw_amt and r.get("usdt") == usdt_amt)]
-            
-            save_group_state(chat_id)
-            append_log(log_path(chat_id, None, dstr), f"[撤销入金] 时间:{ts} 原金额:{raw_amt} USDT:{usdt_amt} 标记:无效操作")
-            await update.message.reply_text(f"✅ 已撤销入金记录\n📊 原金额：+{raw_amt} → {usdt_amt} USDT")
-            await send_summary_with_button(update, chat_id, user.id)
-            return
-            
-        elif out_match:
-            # 撤销下发
-            usdt_amt = trunc2(float(out_match[1]))
-            
-            # 反向操作：如果是正数下发，撤销后增加应下发；如果是负数，则减少应下发
-            state["summary"]["should_send_usdt"] = trunc2(state["summary"]["should_send_usdt"] + usdt_amt)
-            
-            # 从最近记录中移除
-            state["recent"]["out"] = [r for r in state["recent"]["out"] if r.get("usdt") != usdt_amt]
-            
-            save_group_state(chat_id)
-            append_log(log_path(chat_id, None, dstr), f"[撤销下发] 时间:{ts} USDT:{usdt_amt} 标记:无效操作")
-            await update.message.reply_text(f"✅ 已撤销下发记录\n📊 原金额：{usdt_amt} USDT")
-            await send_summary_with_button(update, chat_id, user.id)
-            return
-        else:
-            await update.message.reply_text("❌ 无法识别要撤销的操作\n💡 请回复包含入金或下发记录的账单消息")
-            return
+        # 如果找到了记录，执行撤销
+        if found_record and record_type:
+            if record_type == "in":
+                # 撤销入金
+                raw_amt = found_record.get("raw", 0)
+                usdt_amt = found_record.get("usdt", 0)
+                country = found_record.get("country", "")
+                
+                # 反向操作：减少应下发
+                state["summary"]["should_send_usdt"] = trunc2(state["summary"]["should_send_usdt"] - usdt_amt)
+                
+                # 从记录中移除
+                state["recent"]["in"] = [r for r in state["recent"]["in"] if r.get("msg_id") != replied_msg_id]
+                
+                save_group_state(chat_id)
+                append_log(log_path(chat_id, country, dstr), 
+                          f"[撤销入金] 时间:{ts} 原金额:{raw_amt} USDT:{usdt_amt} 国家:{country or '通用'} 标记:无效操作")
+                
+                await update.message.reply_text(
+                    f"✅ 已撤销入金记录\n"
+                    f"📊 原金额：+{raw_amt} → {usdt_amt} USDT\n"
+                    f"🌍 国家：{country or '通用'}"
+                )
+                await send_summary_with_button(update, chat_id, user.id)
+                return
+                
+            elif record_type == "out":
+                # 判断是出金还是下发
+                is_disbursement = found_record.get("type") == "下发"
+                usdt_amt = found_record.get("usdt", 0)
+                
+                if is_disbursement:
+                    # 撤销下发：反向操作
+                    state["summary"]["should_send_usdt"] = trunc2(state["summary"]["should_send_usdt"] + usdt_amt)
+                    
+                    # 从记录中移除
+                    state["recent"]["out"] = [r for r in state["recent"]["out"] if r.get("msg_id") != replied_msg_id]
+                    
+                    save_group_state(chat_id)
+                    append_log(log_path(chat_id, None, dstr), 
+                              f"[撤销下发] 时间:{ts} USDT:{usdt_amt} 标记:无效操作")
+                    
+                    await update.message.reply_text(
+                        f"✅ 已撤销下发记录\n"
+                        f"📊 原金额：{usdt_amt} USDT"
+                    )
+                else:
+                    # 撤销出金
+                    raw_amt = found_record.get("raw", 0)
+                    country = found_record.get("country", "")
+                    
+                    # 反向操作：减少已下发
+                    state["summary"]["sent_usdt"] = trunc2(state["summary"]["sent_usdt"] - usdt_amt)
+                    
+                    # 从记录中移除
+                    state["recent"]["out"] = [r for r in state["recent"]["out"] if r.get("msg_id") != replied_msg_id]
+                    
+                    save_group_state(chat_id)
+                    append_log(log_path(chat_id, country, dstr), 
+                              f"[撤销出金] 时间:{ts} 原金额:{raw_amt} USDT:{usdt_amt} 国家:{country or '通用'} 标记:无效操作")
+                    
+                    await update.message.reply_text(
+                        f"✅ 已撤销出金记录\n"
+                        f"📊 原金额：-{raw_amt} → {usdt_amt} USDT\n"
+                        f"🌍 国家：{country or '通用'}"
+                    )
+                
+                await send_summary_with_button(update, chat_id, user.id)
+                return
+        
+        # 如果没找到记录
+        await update.message.reply_text(
+            "❌ 无法找到要撤销的交易记录\n\n"
+            "💡 可能原因：\n"
+            "• 这条消息不是交易记录\n"
+            "• 记录可能已被清除或撤销\n"
+            "• 数据已过每日重置时间"
+        )
+        return
 
     # 查看账单（+0 不记录）
     if text == "+0":
@@ -1195,12 +1247,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         usdt = trunc2(amt * (1 - p["rate"]) / p["fx"])
+        # 先不保存message_id，发送后再更新
         push_recent(chat_id, "in", {"ts": ts, "raw": amt, "usdt": usdt, "country": country, "fx": p["fx"], "rate": p["rate"]})
         state["summary"]["should_send_usdt"] = trunc2(state["summary"]["should_send_usdt"] + usdt)
         save_group_state(chat_id)
         append_log(log_path(chat_id, country, dstr),
                    f"[入金] 时间:{ts} 国家:{country or '通用'} 原始:{amt} 汇率:{p['fx']} 费率:{p['rate']*100:.2f}% 结果:{usdt}")
-        await send_summary_with_button(update, chat_id, user.id)
+        
+        # 发送账单并保存message_id
+        msg = await send_summary_with_button(update, chat_id, user.id)
+        
+        # 将message_id保存到最后一条入金记录中
+        if msg and state["recent"]["in"]:
+            state["recent"]["in"][-1]["msg_id"] = msg.message_id
+            save_group_state(chat_id)
+        
         return
 
     # 出金
@@ -1221,7 +1282,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_group_state(chat_id)
         append_log(log_path(chat_id, country, dstr),
                    f"[出金] 时间:{ts} 国家:{country or '通用'} 原始:{amt} 汇率:{p['fx']} 费率:{p['rate']*100:.2f}% 下发:{usdt}")
-        await send_summary_with_button(update, chat_id, user.id)
+        
+        # 发送账单并保存message_id
+        msg = await send_summary_with_button(update, chat_id, user.id)
+        
+        # 将message_id保存到最后一条出金记录中
+        if msg and state["recent"]["out"]:
+            state["recent"]["out"][-1]["msg_id"] = msg.message_id
+            save_group_state(chat_id)
+        
         return
 
     # 下发USDT（仅管理员）
@@ -1245,7 +1314,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 append_log(log_path(chat_id, None, dstr), f"[撤销下发] 时间:{ts} 金额:{usdt_abs} USDT")
             
             save_group_state(chat_id)
-            await send_summary_with_button(update, chat_id, user.id)
+            
+            # 发送账单并保存message_id
+            msg = await send_summary_with_button(update, chat_id, user.id)
+            
+            # 将message_id保存到最后一条下发记录中
+            if msg and state["recent"]["out"]:
+                state["recent"]["out"][-1]["msg_id"] = msg.message_id
+                save_group_state(chat_id)
         except ValueError:
             await update.message.reply_text("❌ 格式错误，请输入有效的数字\n例如：下发35.04 或 下发-35.04")
         return
