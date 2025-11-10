@@ -1261,9 +1261,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 发送账单并保存message_id
         msg = await send_summary_with_button(update, chat_id, user.id)
         
-        # 将message_id保存到最后一条入金记录中
-        if msg and state["recent"]["in"]:
-            state["recent"]["in"][-1]["msg_id"] = msg.message_id
+        # 将message_id保存到最新一条入金记录中（索引0）
+        if msg and state["recent"]["in"] and "msg_id" not in state["recent"]["in"][0]:
+            state["recent"]["in"][0]["msg_id"] = msg.message_id
             save_group_state(chat_id)
         
         return
@@ -1290,9 +1290,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 发送账单并保存message_id
         msg = await send_summary_with_button(update, chat_id, user.id)
         
-        # 将message_id保存到最后一条出金记录中
-        if msg and state["recent"]["out"]:
-            state["recent"]["out"][-1]["msg_id"] = msg.message_id
+        # 将message_id保存到最新一条出金记录中（索引0）
+        if msg and state["recent"]["out"] and "msg_id" not in state["recent"]["out"][0]:
+            state["recent"]["out"][0]["msg_id"] = msg.message_id
             save_group_state(chat_id)
         
         return
@@ -1322,9 +1322,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 发送账单并保存message_id
             msg = await send_summary_with_button(update, chat_id, user.id)
             
-            # 将message_id保存到最后一条下发记录中
-            if msg and state["recent"]["out"]:
-                state["recent"]["out"][-1]["msg_id"] = msg.message_id
+            # 将message_id保存到最新一条下发记录中（索引0）
+            if msg and state["recent"]["out"] and "msg_id" not in state["recent"]["out"][0]:
+                state["recent"]["out"][0]["msg_id"] = msg.message_id
                 save_group_state(chat_id)
         except ValueError:
             await update.message.reply_text("❌ 格式错误，请输入有效的数字\n例如：下发35.04 或 下发-35.04")
