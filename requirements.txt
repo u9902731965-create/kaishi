@@ -2,3 +2,5 @@ python-telegram-bot==21.3
 python-dotenv==1.0.1
 requests
 Flask==3.0.0
+psycopg2-binary==2.9.9
+pytz==2024.1

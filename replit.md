@@ -1,12 +1,17 @@
-# Python Development Environment
+# Telegram Finance Bot - AlwaysData部署版本
 
 ## Overview
-A simple Python environment for manual code execution and library management. This setup gives you full control to write code, run scripts, and manage packages yourself.
+Telegram财务记账Bot，支持交易记录、USDT转换、多群组管理、Web查账等功能。已重构为Webhook模式+PostgreSQL，适合部署到AlwaysData等WSGI平台。
 
 ## Project Structure
-- `main.py` - Main entry point with example code
-- `requirements.txt` - Python package dependencies
-- `.gitignore` - Git ignore rules for Python projects
+- `app.py` - 统一的Flask应用（Bot webhook + Web dashboard）
+- `wsgi.py` - AlwaysData WSGI入口
+- `database.py` - PostgreSQL数据库操作层
+- `database_schema.sql` - 数据库schema
+- `requirements.txt` - Python依赖包
+- `ALWAYSDATA_DEPLOY.md` - 完整部署指南
+- `bot.py` - 原Polling模式代码（已废弃，保留参考）
+- `web_app.py` - 原Web应用（已合并到app.py）
 
 ## How to Use
 
@@ -39,7 +44,29 @@ python filename.py
 
 Or update the workflow configuration to run your preferred script.
 
+## Architecture
+- **Bot模式**：Webhook（而不是Polling）
+- **数据存储**：PostgreSQL（而不是JSON文件）
+- **Web框架**：Flask统一应用
+- **部署目标**：AlwaysData（Python WSGI）
+- **数据库表**：
+  - `groups` - 群组配置
+  - `transactions` - 交易记录
+  - `admins` - 管理员列表
+  - `private_chat_users` - 私聊用户
+  - `group_country_configs` - 国家配置（支持不同国家不同费率/汇率）
+
 ## Recent Changes
+- 2025-11-10:
+  - **重大重构：迁移到AlwaysData部署架构**
+    - Bot从Polling模式改为Webhook模式
+    - 数据存储从JSON文件迁移到PostgreSQL
+    - 创建统一Flask应用（app.py）整合Bot和Web Dashboard
+    - 添加国家配置表支持per-country费率/汇率
+    - 创建完整的AlwaysData部署指南
+    - 新增文件：app.py, database.py, database_schema.sql, wsgi.py
+    - 更新依赖：添加psycopg2-binary, pytz
+    - 保留所有核心功能：交易记录、撤销、清除数据、管理员管理、私聊转发、广播
 - 2025-11-05:
   - **修复精度计算问题**：
     - 入金（已入账）：使用截断到小数点后两位（trunc2），不四舍五入
