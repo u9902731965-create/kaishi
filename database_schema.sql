@@ -78,7 +78,12 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_groups_updated_at ON groups;
 CREATE TRIGGER update_groups_updated_at BEFORE UPDATE ON groups
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_country_configs_updated_at ON group_country_configs;
+CREATE TRIGGER update_country_configs_updated_at BEFORE UPDATE ON group_country_configs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- 示例查询（用于验证）
