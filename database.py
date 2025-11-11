@@ -19,9 +19,19 @@ def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable must be set")
     
+    from urllib.parse import urlparse
+    result = urlparse(DATABASE_URL)
+    
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(
+            host=result.hostname,
+            port=result.port or 5432,
+            user=result.username,
+            password=result.password,
+            database=result.path[1:],
+            cursor_factory=RealDictCursor
+        )
         yield conn
         conn.commit()
     except Exception as e:
