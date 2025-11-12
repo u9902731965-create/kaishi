@@ -57,8 +57,25 @@ Or update the workflow configuration to run your preferred script.
   - `group_country_configs` - 国家配置（支持不同国家不同费率/汇率）
 
 ## Recent Changes
+- 2025-11-12:
+  - **平台迁移决策：从AlwaysData切换到ClawCloud Run**
+    - 发现：AlwaysData User Program不支持长期运行的进程（定期发送SIGTERM）
+    - 测试结果：进程启动后1-25分钟被强制终止，不适合Bot应用
+    - 新目标：ClawCloud Run（£5/月免费额度，支持PostgreSQL，Docker原生）
+  - **更新部署架构为ClawCloud**
+    - 更新 start.sh：使用 app.py（PostgreSQL版本）替代旧的 bot.py + web_app.py
+    - 更新 .dockerignore：排除旧版文件（bot.py, web_app.py）
+    - 创建完整部署指南：CLAWCLOUD_POSTGRESQL_DEPLOY.md
+    - 架构确认：app.py 是正确的统一入口点（Bot Webhook + Web Dashboard）
+  - **部署配置优化**
+    - database_schema.sql 已验证为幂等（支持重复执行）
+    - Dockerfile 无需更改（已配置正确）
+    - start.sh 添加数据库初始化步骤
+  - **文件清理**
+    - 标记废弃文件：bot.py, web_app.py（保留作参考，不打包进Docker）
+    - 所有新部署使用 app.py（PostgreSQL + Webhook）
 - 2025-11-10:
-  - **重大重构：迁移到AlwaysData部署架构**
+  - **重大重构：迁移到AlwaysData部署架构**（已废弃，改用ClawCloud）
     - Bot从Polling模式改为Webhook模式
     - 数据存储从JSON文件迁移到PostgreSQL
     - 创建统一Flask应用（app.py）整合Bot和Web Dashboard

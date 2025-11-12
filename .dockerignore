@@ -48,3 +48,13 @@ replit.nix
 render.yaml
 RENDER_POLLING_DEPLOY.md
 CLAWCLOUD_DEPLOY.md
+
+# 旧版文件（已废弃，使用 app.py 替代）
+bot.py
+web_app.py
+
+# 备份文件
+local_backup/
+*.tar.gz
+*.zip
+attached_assets/

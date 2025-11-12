@@ -1,53 +1,43 @@
 #!/bin/bash
-# 启动脚本 - 同时运行Telegram Bot和Web应用
+# 启动脚本 - 统一Flask应用（PostgreSQL版本）
 
-echo "🚀 启动Telegram财务Bot和Web查账系统..."
+echo "🚀 启动Telegram财务Bot (PostgreSQL版本)..."
 echo "📋 环境变量检查："
 echo "   PORT=${PORT:-未设置}"
-echo "   WEB_PORT=${WEB_PORT:-未设置}"
+echo "   DATABASE_URL=${DATABASE_URL:+已设置}"
 echo "   TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:+已设置}"
 echo "   OWNER_ID=${OWNER_ID:-未设置}"
+echo "   WEBHOOK_URL=${WEBHOOK_URL:-未设置}"
+echo "   SESSION_SECRET=${SESSION_SECRET:+已设置}"
 
-# 在后台启动Web应用
+# 初始化数据库
 echo ""
-echo "🌐 启动Web查账系统..."
-python web_app.py 2>&1 | sed 's/^/[WEB] /' &
-WEB_PID=$!
-echo "   - Web应用 PID: $WEB_PID"
+echo "🗄️  初始化数据库..."
+python -c "import database; database.init_database()" 2>&1 || {
+    echo "⚠️  数据库初始化失败，但继续启动..."
+}
 
-# 等待3秒确保Web应用启动
-sleep 3
-
-# 启动Telegram Bot（后台运行）
+# 启动统一Flask应用（Bot Webhook + Web Dashboard）
 echo ""
-echo "🤖 启动Telegram Bot..."
-python bot.py 2>&1 | sed 's/^/[BOT] /' &
-BOT_PID=$!
-echo "   - Bot PID: $BOT_PID"
+echo "🌐 启动Flask应用（Bot + Web Dashboard）..."
+python app.py 2>&1 &
+APP_PID=$!
+echo "   - 应用 PID: $APP_PID"
 
 echo ""
-echo "✅ 两个服务已启动"
+echo "✅ 应用已启动"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📊 Web查账系统: http://0.0.0.0:${PORT:-5000}"
-echo "🤖 Telegram Bot: 运行中"
+echo "📊 Web Dashboard: http://0.0.0.0:${PORT:-5000}"
+echo "🤖 Telegram Bot: Webhook模式"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 健康检查函数
-check_web_health() {
-    if ! kill -0 $WEB_PID 2>/dev/null; then
-        echo "❌ Web应用进程已退出，尝试重启..."
-        python web_app.py 2>&1 | sed 's/^/[WEB] /' &
-        WEB_PID=$!
-        echo "   - 新的Web应用 PID: $WEB_PID"
-    fi
-}
-
-check_bot_health() {
-    if ! kill -0 $BOT_PID 2>/dev/null; then
-        echo "⚠️ Bot进程已退出，尝试重启..."
-        python bot.py 2>&1 | sed 's/^/[BOT] /' &
-        BOT_PID=$!
-        echo "   - 新的Bot PID: $BOT_PID"
+check_app_health() {
+    if ! kill -0 $APP_PID 2>/dev/null; then
+        echo "❌ Flask应用进程已退出，尝试重启..."
+        python app.py 2>&1 &
+        APP_PID=$!
+        echo "   - 新的应用 PID: $APP_PID"
     fi
 }
 
@@ -56,6 +46,5 @@ echo ""
 echo "🔄 进入监控循环（每30秒检查一次）..."
 while true; do
     sleep 30
-    check_web_health
-    check_bot_health
+    check_app_health
 done
