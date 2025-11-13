@@ -709,52 +709,57 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # 入金
-    if text.startswith("+"):
-        if not is_bot_admin(user.id):
-            return
-        
-        amt, country = parse_amount_and_country(text)
-        if amt is None:
-            return
-        
-        if fx == 0:
-    await update.message.reply_text("⚠️ 请先设置费率和汇率")
+if text.startswith("+"):
+    if not is_admin(user.id):
+        return
+
+    amt, country = parse_amount_and_country(text)
+    config = db.get_group_config(chat_id)
+
+    rate = config.get('in_rate', 0)
+    fx   = config.get('in_fx', 0)
+
+    if fx == 0:
+        await update.message.reply_text("⚠️ 请先设置费率和汇率")
+        return
+
+    # -------- 转换为 float 防止 Decimal 报错 --------
+    amt_f = float(amt)
+    rate_f = float(rate)
+    fx_f = float(fx)
+
+    # -------- 计算入金 USDT --------
+    usdt = trunc2(amt_f * (1 - rate_f) / fx_f)
+
+    # -------- 写入数据库（使用 Decimal 存储）--------
+    txn_id = db.add_transaction(
+        chat_id=chat_id,
+        transaction_type='in',
+        amount=Decimal(str(amt)),
+        rate=Decimal(str(rate)),
+        fx=Decimal(str(fx)),
+        usdt=Decimal(str(usdt)),
+        timestamp=ts,
+        country=country,
+        operator_id=user.id,
+        operator_name=user.first_name
+    )
+
+    # -------- 写入日志 --------
+    append_log(
+        log_path(chat_id, country, dstr),
+        f"[入金] 时间:{ts} 国家:{country or '通用'} "
+        f"原始:{amt} 汇率:{fx} 费率:{rate*100:.2f}% 结果:{usdt}"
+    )
+
+    # -------- 回复账单 + 保存 message_id --------
+    msg = await send_summary_with_button(update, chat_id, user.id)
+
+    if msg:
+        db.set_message_id(txn_id, msg.message_id)
+
     return
 
-# 数字全部转换为 float 用于计算
-amt_f = float(amt)
-rate_f = float(rate)
-fx_f = float(fx)
-
-# 计算 USDT
-usdt = trunc2(amt_f * (1 - rate_f) / fx_f)
-
-# 写入数据库
-txn_id = db.add_transaction(
-    chat_id=chat_id,
-    transaction_type='in',
-    amount=Decimal(str(amt)),
-    rate=Decimal(str(rate)),
-    fx=Decimal(str(fx)),
-    usdt=Decimal(str(usdt)),
-    timestamp=ts,
-    country=country,
-    operator_id=user.id,
-    operator_name=user.first_name
-)
-        
-        append_log(
-            log_path(chat_id, country, dstr),
-            f"[入金] 时间:{ts} 国家:{country} 原始:{amt} 汇率:{fx} 费率:{rate*100:.2f}% 结果:{usdt}"
-        )
-        
-        msg = await send_summary_with_button(update, chat_id, user.id)
-        
-        # 保存message_id用于撤销功能
-        if msg and txn_id:
-            db.update_transaction_message_id(txn_id, msg.message_id)
-        
-        return
     
     # 出金
     if text.startswith("-"):
