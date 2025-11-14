@@ -302,7 +302,7 @@ def render_full_summary(chat_id: int) -> str:
     config = db.get_group_config(chat_id)
     summary = db.get_transactions_summary(chat_id)
 
-    bot_name = config.get("group_name") or "AA全球国际支付"
+    bot_name = config.get("group_name") or "全球国际支付"
 
     in_records = summary["in_records"]
     out_records = summary["out_records"]
@@ -934,6 +934,8 @@ def init_app():
 
     db.init_database()
     logger.info("✅ 数据库初始化完成")
+
+    db.delete_old_transactions(30)   # ✨ 只保留最近 30 天的数据
 
     if OWNER_ID and OWNER_ID.isdigit():
         db.add_admin(int(OWNER_ID), None, "Owner", is_owner=True)
