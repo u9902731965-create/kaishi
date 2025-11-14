@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-统一Flask应用 - Telegram Bot Webhook + Web Dashboard
-PostgreSQL 版本（已修复 Decimal 计算和统计问题）
+统一 Flask 应用：
+- Telegram Bot（Webhook 模式）
+- Web Dashboard（查账页面）
+
+数据库：PostgreSQL（database.py）
 """
 
 import os
@@ -19,15 +22,23 @@ from functools import wraps
 import threading
 import asyncio
 
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session
+from flask import Flask, render_template, request, jsonify, session
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 import database as db
 
-# ========== 环境与基础配置 ==========
+# =========================================================
+# 配置 & 初始化
+# =========================================================
 
 load_dotenv()
 
@@ -41,54 +52,51 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", "5000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("❌ 错误：未找到 TELEGRAM_BOT_TOKEN 环境变量")
+    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN 未设置")
 
 if not SESSION_SECRET:
-    print("⚠️  警告：SESSION_SECRET 未设置，Web查账功能将不可用")
-    SESSION_SECRET = os.urandom(32).hex()
+    print("⚠️  SESSION_SECRET 未设置，Web 查账将不可用")
 
-app.secret_key = SESSION_SECRET
+app.secret_key = SESSION_SECRET or os.urandom(24)
 
-# 日志
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# 数据 & 日志目录
 DATA_DIR = Path("./data")
 LOG_DIR = DATA_DIR / "logs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Telegram Application & 事件循环
 telegram_app: Application | None = None
 bot_loop: asyncio.AbstractEventLoop | None = None
-bot_thread: threading.Thread | None = None
 
-# ========== 通用工具函数 ==========
+# =========================================================
+# 工具函数
+# =========================================================
 
 
 def trunc2(x) -> float:
-    """截断到小数点后两位（用于入金）"""
+    """截断到小数点后两位（用于入金计算），兼容 float / Decimal"""
     x = float(x)
     rounded = round(x, 6)
     return math.floor(rounded * 100.0) / 100.0
 
 
 def round2(x) -> float:
-    """四舍五入到小数点后两位（用于出金/下发）"""
+    """四舍五入到小数点后两位（用于出金 / 下发计算），兼容 float / Decimal"""
     x = float(x)
     return round(x, 2)
 
 
 def fmt_usdt(x: float) -> str:
-    return f"{float(x):.2f} USDT"
+    return f"{x:.2f} USDT"
 
 
 def to_superscript(num: int) -> str:
-    """数字转上标"""
+    """将数字转换为上标"""
     superscript_map = {
         "0": "⁰",
         "1": "¹",
@@ -106,22 +114,23 @@ def to_superscript(num: int) -> str:
 
 
 def now_ts() -> str:
-    """北京时间 HH:MM"""
+    """当前时间（北京时间 HH:MM）"""
     import pytz
 
-    beijing = pytz.timezone("Asia/Shanghai")
-    return datetime.now(beijing).strftime("%H:%M")
+    beijing_tz = pytz.timezone("Asia/Shanghai")
+    return datetime.now(beijing_tz).strftime("%H:%M")
 
 
 def today_str() -> str:
-    """北京时间 YYYY-MM-DD"""
+    """当前日期（北京时间 YYYY-MM-DD）"""
     import pytz
 
-    beijing = pytz.timezone("Asia/Shanghai")
-    return datetime.now(beijing).strftime("%Y-%m-%d")
+    beijing_tz = pytz.timezone("Asia/Shanghai")
+    return datetime.now(beijing_tz).strftime("%Y-%m-%d")
 
 
 def log_path(chat_id: int, country: str | None = None, date_str: str | None = None) -> Path:
+    """群组日志文件路径"""
     if date_str is None:
         date_str = today_str()
 
@@ -142,10 +151,7 @@ def append_log(path: Path, text: str):
 
 
 def parse_amount_and_country(text: str):
-    """
-    解析 +100 / 日本 这种格式
-    返回 (金额, 国家字符串或 '通用')
-    """
+    """解析 +100 / 日本 这样的文本，返回 (amount, country)"""
     m = re.match(r"^[\+\-]\s*([0-9]+(?:\.[0-9]+)?)", text.strip())
     if not m:
         return None, None
@@ -156,44 +162,46 @@ def parse_amount_and_country(text: str):
 
 
 def is_bot_admin(user_id: int) -> bool:
-    """判断是否为机器人管理员（包含 OWNER）"""
+    """是否机器人管理员"""
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
     return db.is_admin(user_id)
 
 
-# ========== Web Token 相关 ==========
+# ------------------- Web Token 认证 ---------------------
 
 
-def generate_web_token(chat_id: int, user_id: int, expires_hours: int = 24) -> str:
-    """生成访问 Dashboard 的 token"""
+def generate_web_token(chat_id: int, user_id: int, expires_hours: int = 24) -> str | None:
+    if not SESSION_SECRET:
+        return None
+
     expires_at = int((datetime.now() + timedelta(hours=expires_hours)).timestamp())
     data = f"{chat_id}:{user_id}:{expires_at}"
     signature = hmac.new(
-        SESSION_SECRET.encode(),
-        data.encode(),
-        hashlib.sha256,
+        SESSION_SECRET.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
     ).hexdigest()
     return f"{data}:{signature}"
 
 
 def verify_token(token: str):
-    """验证 token"""
+    if not SESSION_SECRET:
+        return None
+
     try:
         parts = token.split(":")
         if len(parts) != 4:
             return None
-        chat_id_s, user_id_s, expires_at_s, signature = parts
-        chat_id = int(chat_id_s)
-        user_id = int(user_id_s)
-        expires_at = int(expires_at_s)
+
+        chat_id, user_id, expires_at, signature = parts
+        chat_id = int(chat_id)
+        user_id = int(user_id)
+        expires_at = int(expires_at)
 
         data = f"{chat_id}:{user_id}:{expires_at}"
         expected = hmac.new(
-            SESSION_SECRET.encode(),
-            data.encode(),
-            hashlib.sha256,
+            SESSION_SECRET.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
         ).hexdigest()
+
         if signature != expected:
             return None
         if datetime.now().timestamp() > expires_at:
@@ -210,104 +218,75 @@ def login_required(f):
         token = request.args.get("token") or session.get("token")
         if not token:
             return "未授权访问", 403
-        info = verify_token(token)
-        if not info:
+        user_info = verify_token(token)
+        if not user_info:
             return "Token 无效或已过期", 403
+
         session["token"] = token
-        session["user_info"] = info
+        session["user_info"] = user_info
         return f(*args, **kwargs)
 
     return wrapper
 
 
 def generate_web_url(chat_id: int, user_id: int) -> str | None:
-    if not WEB_BASE_URL:
+    if not SESSION_SECRET:
         return None
+
     token = generate_web_token(chat_id, user_id)
+    if not token:
+        return None
+
+    # 使用 WEB_BASE_URL，而不是 localhost
     return f"{WEB_BASE_URL.rstrip('/')}/dashboard?token={token}"
 
 
-# ========== 从数据库计算汇总（新的可靠版本） ==========
+# =========================================================
+# 汇总渲染
+# =========================================================
 
 
-def compute_today_summary(chat_id: int):
-    """
-    统一使用 db.get_today_transactions 来计算今日入金/出金/下发，
-    保证和 Web Dashboard 统计完全一致。
-    """
-    txns = db.get_today_transactions(chat_id)
-
-    # ✅ 按时间倒序排序：最新记录在最前面
-    def _ts_key(t):
-        # 优先用 created_at（datetime），没有就用 timestamp 字符串
-        created = t.get("created_at")
-        if created is not None:
-            return created
-        return t.get("timestamp", "")
-    txns = sorted(txns, key=_ts_key, reverse=True)
-
-    in_records = []
-    out_records = []
-    send_records = []
-
-    total_in_usdt = 0.0
-    total_out_usdt = 0.0
-    total_send_usdt = 0.0
-
-    for t in txns:
-        t_type = t["transaction_type"]
-        amount = float(t["amount"])
-        rate = float(t["rate"])
-        fx = float(t["fx"])
-        usdt = float(t["usdt"])
-        ts = t["timestamp"]
-        country = t.get("country") or "通用"
-        rec = {
-            "amount": amount,
-            "rate": rate,
-            "fx": fx,
-            "usdt": usdt,
-            "timestamp": ts,
-            "country": country,
-        }
-
-        if t_type == "in":
-            in_records.append(rec)
-            total_in_usdt += usdt
-        elif t_type == "out":
-            out_records.append(rec)
-            total_out_usdt += usdt
-        elif t_type == "send":
-            send_records.append(rec)
-            total_send_usdt += abs(usdt)
-
-    should_send = trunc2(total_in_usdt)
-    sent_usdt = round2(total_out_usdt + total_send_usdt)
-
-    return {
-        "in_records": in_records,
-        "out_records": out_records,
-        "send_records": send_records,
-        "should_send": should_send,
-        "sent_usdt": sent_usdt,
-    }
-
-
-# ========== 群内汇总渲染 ==========
-
-
-def render_group_summary(chat_id: int) -> str:
+def _compute_summary(chat_id: int):
+    """从数据库获取记录，并在应用层做一次统一计算"""
     config = db.get_group_config(chat_id)
-    summary = compute_today_summary(chat_id)
+    summary = db.get_transactions_summary(chat_id)
 
-    bot_name = config.get("group_name") or "AA全球国际支付"
     in_records = summary["in_records"]
     out_records = summary["out_records"]
     send_records = summary["send_records"]
 
-    should = summary["should_send"]
-    sent = summary["sent_usdt"]
+    # 入 / 出 的 USDT 总额
+    total_in_usdt = sum(float(r["usdt"]) for r in in_records)
+    total_out_usdt = sum(float(r["usdt"]) for r in out_records)
+    # send.usdt 是有符号的：下发100 为 +100， 下发-100 为 -100
+    total_send_usdt = sum(float(r["usdt"]) for r in send_records)
+
+    should = trunc2(total_in_usdt - total_out_usdt)
+    sent = trunc2(total_send_usdt)
     diff = trunc2(should - sent)
+
+    return {
+        "config": config,
+        "in_records": in_records,
+        "out_records": out_records,
+        "send_records": send_records,
+        "should": should,
+        "sent": sent,
+        "diff": diff,
+    }
+
+
+def render_group_summary(chat_id: int) -> str:
+    data = _compute_summary(chat_id)
+    config = data["config"]
+    in_records = data["in_records"]
+    out_records = data["out_records"]
+    send_records = data["send_records"]
+    should = data["should"]
+    sent = data["sent"]
+    diff = data["diff"]
+
+    bot_name = config.get("group_name", "AA全球国际支付")
 
     rin = float(config.get("in_rate", 0))
     fin = float(config.get("in_fx", 0))
@@ -317,44 +296,49 @@ def render_group_summary(chat_id: int) -> str:
     lines: list[str] = []
     lines.append(f"📊【{bot_name} 账单汇总】\n")
 
-    # 入金
+    # 入金记录（最新在上，最多 5 条）
     lines.append(f"已入账 ({len(in_records)}笔)")
-    for r in in_records[:5]:
-        raw = r["amount"]
-        fx = r["fx"]
-        rate = r["rate"]
-        usdt = trunc2(r["usdt"])
+    recent_in = list(reversed(in_records))[:5]
+    for r in recent_in:
+        raw = float(r["amount"])
+        fx = float(r["fx"])
+        rate = float(r["rate"])
+        usdt = trunc2(float(r["usdt"]))
         ts = r["timestamp"]
         rate_percent = int(rate * 100)
         rate_sup = to_superscript(rate_percent)
-        lines.append(f"{ts} {raw}  {rate_sup}/ {fx} = {usdt}")
+        lines.append(f"{ts} {raw:.2f}  {rate_sup}/ {fx:.2f} = {usdt:.2f}")
     lines.append("")
 
-    # 出金
+    # 出金记录（最新在上，最多 5 条）
     lines.append(f"已出账 ({len(out_records)}笔)")
-    for r in out_records[:5]:
-        raw = r["amount"]
-        fx = r["fx"]
-        rate = r["rate"]
-        usdt = round2(r["usdt"])
+    recent_out = list(reversed(out_records))[:5]
+    for r in recent_out:
+        raw = float(r["amount"])
+        fx = float(r["fx"])
+        rate = float(r["rate"])
+        usdt = round2(float(r["usdt"]))
         ts = r["timestamp"]
         rate_percent = int(rate * 100)
         rate_sup = to_superscript(rate_percent)
-        lines.append(f"{ts} {raw}  {rate_sup}/ {fx} = {usdt}")
+        lines.append(f"{ts} {raw:.2f}  {rate_sup}/ {fx:.2f} = {usdt:.2f}")
     lines.append("")
 
-    # 下发
+    # 下发记录（最新在上，最多 5 条，带正负号）
     if send_records:
         lines.append(f"已下发 ({len(send_records)}笔)")
-        for r in send_records[:5]:
-            usdt = round2(abs(r["usdt"]))
+        recent_send = list(reversed(send_records))[:5]
+        for r in recent_send:
+            raw_usdt = float(r["usdt"])  # 有符号
             ts = r["timestamp"]
-            lines.append(f"{ts} {usdt}")
+            sign = "-" if raw_usdt < 0 else ""
+            usdt = round2(abs(raw_usdt))
+            lines.append(f"{ts} {sign}{usdt:.2f}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"⚙️ 当前费率：入 {rin*100:.0f}% ⇄ 出 {rout*100:.0f}%")
-    lines.append(f"💱 固定汇率：入 {fin} ⇄ 出 {fout}")
+    lines.append(f"🧮 当前费率：入 {rin*100:.0f}% ⇄ 出 {rout*100:.0f}%")
+    lines.append(f"💱 固定汇率：入 {fin:.2f} ⇄ 出 {fout:.2f}")
     lines.append(f"📊 应下发：{fmt_usdt(should)}")
     lines.append(f"📤 已下发：{fmt_usdt(sent)}")
     lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
@@ -365,17 +349,16 @@ def render_group_summary(chat_id: int) -> str:
 
 
 def render_full_summary(chat_id: int) -> str:
-    config = db.get_group_config(chat_id)
-    summary = compute_today_summary(chat_id)
+    data = _compute_summary(chat_id)
+    config = data["config"]
+    in_records = data["in_records"]
+    out_records = data["out_records"]
+    send_records = data["send_records"]
+    should = data["should"]
+    sent = data["sent"]
+    diff = data["diff"]
 
-    bot_name = config.get("group_name") or "AA全球国际支付"
-    in_records = summary["in_records"]
-    out_records = summary["out_records"]
-    send_records = summary["send_records"]
-
-    should = summary["should_send"]
-    sent = summary["sent_usdt"]
-    diff = trunc2(should - sent)
+    bot_name = config.get("group_name", "AA全球国际支付")
 
     rin = float(config.get("in_rate", 0))
     fin = float(config.get("in_fx", 0))
@@ -385,44 +368,46 @@ def render_full_summary(chat_id: int) -> str:
     lines: list[str] = []
     lines.append(f"📊【{bot_name} 完整账单】\n")
 
-    # 全部入金
+    # 所有入金（最新在上）
     lines.append(f"已入账 ({len(in_records)}笔)")
-    for r in in_records:
-        raw = r["amount"]
-        fx = r["fx"]
-        rate = r["rate"]
-        usdt = trunc2(r["usdt"])
+    for r in reversed(in_records):
+        raw = float(r["amount"])
+        fx = float(r["fx"])
+        rate = float(r["rate"])
+        usdt = trunc2(float(r["usdt"]))
         ts = r["timestamp"]
         rate_percent = int(rate * 100)
         rate_sup = to_superscript(rate_percent)
-        lines.append(f"{ts} {raw}  {rate_sup}/ {fx} = {usdt}")
+        lines.append(f"{ts} {raw:.2f}  {rate_sup}/ {fx:.2f} = {usdt:.2f}")
     lines.append("")
 
-    # 全部出金
+    # 所有出金（最新在上）
     lines.append(f"已出账 ({len(out_records)}笔)")
-    for r in out_records:
-        raw = r["amount"]
-        fx = r["fx"]
-        rate = r["rate"]
-        usdt = round2(r["usdt"])
+    for r in reversed(out_records):
+        raw = float(r["amount"])
+        fx = float(r["fx"])
+        rate = float(r["rate"])
+        usdt = round2(float(r["usdt"]))
         ts = r["timestamp"]
         rate_percent = int(rate * 100)
         rate_sup = to_superscript(rate_percent)
-        lines.append(f"{ts} {raw}  {rate_sup}/ {fx} = {usdt}")
+        lines.append(f"{ts} {raw:.2f}  {rate_sup}/ {fx:.2f} = {usdt:.2f}")
     lines.append("")
 
-    # 全部下发
+    # 所有下发（最新在上，带正负号）
     if send_records:
         lines.append(f"已下发 ({len(send_records)}笔)")
-        for r in send_records:
-            usdt = round2(abs(r["usdt"]))
+        for r in reversed(send_records):
+            raw_usdt = float(r["usdt"])
             ts = r["timestamp"]
-            lines.append(f"{ts} {usdt}")
+            sign = "-" if raw_usdt < 0 else ""
+            usdt = round2(abs(raw_usdt))
+            lines.append(f"{ts} {sign}{usdt:.2f}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"⚙️ 当前费率：入 {rin*100:.0f}% ⇄ 出 {rout*100:.0f}%")
-    lines.append(f"💱 固定汇率：入 {fin} ⇄ 出 {fout}")
+    lines.append(f"🧮 当前费率：入 {rin*100:.0f}% ⇄ 出 {rout*100:.0f}%")
+    lines.append(f"💱 固定汇率：入 {fin:.2f} ⇄ 出 {fout:.2f}")
     lines.append(f"📊 应下发：{fmt_usdt(should)}")
     lines.append(f"📤 已下发：{fmt_usdt(sent)}")
     lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
@@ -432,17 +417,18 @@ def render_full_summary(chat_id: int) -> str:
 
 
 async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
-    """发送账单汇总 + Web 查账按钮"""
+    """发送带 Web 查账按钮的账单汇总"""
     text = render_group_summary(chat_id)
-    markup = None
 
-    url = generate_web_url(chat_id, user_id)
-    if url:
+    if SESSION_SECRET:
+        web_url = generate_web_url(chat_id, user_id)
+    else:
+        web_url = None
+
+    if web_url:
         markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📊 查看账单明细", url=url)]]
+            [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
         )
-
-    if markup:
         msg = await update.message.reply_text(text, reply_markup=markup)
     else:
         msg = await update.message.reply_text(text)
@@ -450,16 +436,14 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
     return msg
 
 
-# ========== Telegram 命令 & 文本处理 ==========
+# =========================================================
+# Telegram 命令 & 文本处理
+# =========================================================
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
     user = update.effective_user
-
-    # 记录私聊用户
-    if chat.type == "private":
-        db.add_private_chat_user(user.id, user.username, user.first_name)
+    chat = update.effective_chat
 
     help_text = (
         "🤖 你好，我是财务记账机器人。\n\n"
@@ -471,20 +455,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  下发35.04（记录下发并扣除应下发）\n"
         "  下发-35.04（撤销下发并增加应下发）\n\n"
         "🔄 撤销操作（仅管理员）：\n"
-        "  回复账单消息，输入：撤销\n"
-        "  （必须准确输入「撤销」二字）\n\n"
+        "  回复账单消息 + 输入：撤销\n"
+        "  （必须准确输入“撤销”二字）\n\n"
         "⚙️ 快速设置（仅管理员）：\n"
-        "  重置默认值（推荐费率/汇率）\n"
-        "  清除数据（今日 00:00 至现在）\n"
-        "  设置入金费率 20\n"
+        "  重置默认值（一键设置推荐费率/汇率）\n"
+        "  清除数据（清除今日00:00至现在的所有数据）\n"
+        "  设置入金费率 10\n"
         "  设置入金汇率 153\n"
         "  设置出金费率 2\n"
-        "  设置出金汇率 142\n\n"
+        "  设置出金汇率 137\n\n"
         "👥 管理员管理：\n"
         "  设置机器人管理员（回复消息）\n"
         "  删除机器人管理员（回复消息）\n"
         "  显示机器人管理员"
     )
+
+    if chat.type == "private":
+        db.add_private_chat_user(user.id, user.username, user.first_name)
 
     await update.message.reply_text(help_text)
 
@@ -501,33 +488,83 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         db.add_private_chat_user(user.id, user.username, user.first_name)
 
-        # 私聊简单转发给 OWNER
-        if OWNER_ID and OWNER_ID.isdigit() and user.id != int(OWNER_ID):
-            owner_id = int(OWNER_ID)
-            try:
-                info = f"👤 {user.full_name}"
-                if user.username:
-                    info += f" (@{user.username})"
-                info += f"\n🆔 User ID: {user.id}"
+        private_log_dir = LOG_DIR / "private_chats"
+        private_log_dir.mkdir(exist_ok=True)
+        user_log_file = private_log_dir / f"user_{user.id}.log"
+        log_entry = f"[{ts}] {user.full_name} (@{user.username or 'N/A'}): {text}\n"
+        with open(user_log_file, "a", encoding="utf-8") as f:
+            f.write(log_entry)
 
-                msg = (
-                    "📨 收到私聊消息\n"
-                    f"{info}\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"{text}\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "💡 直接回复此消息即可回复用户"
+        # OWNER 专属功能：广播
+        if OWNER_ID and OWNER_ID.isdigit() and user.id == int(OWNER_ID):
+            if text.startswith("广播 ") or text.startswith("群发 "):
+                broadcast_text = text.split(" ", 1)[1].strip()
+                if not broadcast_text:
+                    await update.message.reply_text(
+                        "❌ 请输入广播内容\n\n用法：广播 你的内容"
+                    )
+                    return
+
+                users = db.get_all_private_chat_users()
+                success = 0
+                failed = 0
+                await update.message.reply_text(
+                    f"📢 开始广播，目标用户：{len(users)} 人"
                 )
-                await context.bot.send_message(owner_id, msg)
-            except Exception as e:
-                logger.error(f"转发私聊消息失败: {e}")
+                for u in users:
+                    uid = u["user_id"]
+                    if OWNER_ID and OWNER_ID.isdigit() and uid == int(OWNER_ID):
+                        continue
+                    try:
+                        await context.bot.send_message(
+                            chat_id=uid,
+                            text=f"📢 系统通知：\n\n{broadcast_text}",
+                        )
+                        success += 1
+                    except Exception as e:
+                        logger.error(f"广播失败 {uid}: {e}")
+                        failed += 1
 
+                await update.message.reply_text(
+                    f"✅ 广播完成\n成功：{success} 人\n失败：{failed} 人"
+                )
+                return
+
+            if text in ["help", "帮助", "功能"]:
+                await update.message.reply_text(
+                    "👑 OWNER 专属功能：\n\n"
+                    "📢 广播：\n"
+                    "  广播 你的内容\n"
+                    "  群发 你的内容\n"
+                )
+                return
+
+        # 把私聊转发给 OWNER
+        if OWNER_ID and OWNER_ID.isdigit():
+            owner_id = int(OWNER_ID)
+            if user.id != owner_id:
+                try:
+                    info = f"👤 {user.full_name}"
+                    if user.username:
+                        info += f" (@{user.username})"
+                    info += f"\n🆔 User ID: {user.id}"
+                    forward_text = (
+                        "📨 收到私聊消息\n"
+                        f"{info}\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{text}\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "💡 直接回复此消息即可回信给用户"
+                    )
+                    await context.bot.send_message(owner_id, forward_text)
+                except Exception as e:
+                    logger.error(f"转发私聊失败: {e}")
         return
 
-    # ---------- 群聊（确保有 group 配置） ----------
-    db.get_group_config(chat_id)
+    # ---------- 群聊 ----------
+    db.get_group_config(chat_id)  # 确保群记录存在
 
-    # 管理员展示
+    # ----- 管理员列表 -----
     if text == "显示机器人管理员":
         if not is_bot_admin(user.id):
             return
@@ -537,45 +574,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["👥 机器人管理员列表：\n"]
         for a in admins:
-            name = a.get("first_name", "Unknown") or "Unknown"
-            username = a.get("username") or ""
+            name = a.get("first_name", "Unknown")
+            username = a.get("username") or "N/A"
             uid = a["user_id"]
             is_owner = a.get("is_owner", False)
-            star = " 🔱" if is_owner else ""
-            if username:
-                lines.append(f"• {name} (@{username}){star}")
-            else:
-                lines.append(f"• {name}{star}")
+            status = " 🔱" if is_owner else ""
+            lines.append(f"• {name} (@{username}){status}")
             lines.append(f"  ID: {uid}")
         await update.message.reply_text("\n".join(lines))
         return
 
-    # 设置/删除管理员
-    if text in ("设置机器人管理员", "添加机器人管理员"):
+    # ----- 设置 / 删除 管理员 -----
+    if text in ["设置机器人管理员", "添加机器人管理员"]:
         if not is_bot_admin(user.id):
             return
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ 请回复要设置为管理员的那条消息")
+            await update.message.reply_text("❌ 请先回复要设置为管理员的那条消息")
             return
-        target = update.message.reply_to_message.from_user
-        db.add_admin(target.id, target.username, target.first_name, is_owner=False)
+        target_user = update.message.reply_to_message.from_user
+        db.add_admin(
+            target_user.id,
+            target_user.username,
+            target_user.first_name,
+            is_owner=False,
+        )
         await update.message.reply_text(
-            f"✅ 已将 {target.first_name} 设置为机器人管理员\n🆔 User ID: {target.id}"
+            f"✅ 已将 {target_user.first_name} 设置为机器人管理员\n🆔 {target_user.id}"
         )
         return
 
-    if text in ("删除机器人管理员", "移除机器人管理员"):
+    if text in ["删除机器人管理员", "移除机器人管理员"]:
         if not is_bot_admin(user.id):
             return
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ 请回复要删除的管理员消息")
+            await update.message.reply_text("❌ 请先回复要删除的管理员消息")
             return
-        target = update.message.reply_to_message.from_user
-        db.remove_admin(target.id)
-        await update.message.reply_text(f"✅ 已移除 {target.first_name} 的管理员权限")
+        target_user = update.message.reply_to_message.from_user
+        db.remove_admin(target_user.id)
+        await update.message.reply_text(
+            f"✅ 已移除 {target_user.first_name} 的管理员权限"
+        )
         return
 
-    # 撤销（回复账单消息 + 输入“撤销”）
+    # ----- 撤销一条账单 -----
     if text == "撤销":
         if not is_bot_admin(user.id):
             return
@@ -585,91 +626,89 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = update.message.reply_to_message.message_id
         deleted = db.delete_transaction_by_message_id(msg_id)
         if deleted:
+            ttype = deleted["transaction_type"]
+            amt = float(deleted["amount"])
+            usdt = float(deleted["usdt"])
             await update.message.reply_text(
-                f"✅ 已撤销交易\n"
-                f"类型: {deleted['transaction_type']}\n"
-                f"金额: {deleted['amount']}\n"
-                f"USDT: {deleted['usdt']}"
+                "✅ 已撤销交易：\n"
+                f"类型: {ttype}\n"
+                f"金额: {amt}\n"
+                f"USDT: {usdt}"
             )
             await send_summary_with_button(update, chat_id, user.id)
         else:
             await update.message.reply_text("❌ 未找到该消息对应的交易记录")
         return
 
-    # 快速设置：重置默认值
+    # ----- 重置默认值 -----
     if text == "重置默认值":
         if not is_bot_admin(user.id):
             return
         db.update_group_config(
-            chat_id,
-            in_rate=0.20,  # 20%
-            in_fx=153,
-            out_rate=0.00,  # 出金费率可以单独再设
-            out_fx=142,
+            chat_id, in_rate=0.10, in_fx=153, out_rate=0.02, out_fx=137
         )
         await update.message.reply_text(
-            "✅ 已重置默认点位\n\n"
-            "📥 入金设置：费率 20%，汇率 153\n"
-            "📤 出金设置：费率 0%，汇率 142"
+            "✅ 已重置为默认值：\n\n"
+            "📥 入金：费率 10%  汇率 153\n"
+            "📤 出金：费率 2%   汇率 137"
         )
         return
 
-    # 清除今日数据
+    # ----- 清除今日数据 -----
     if text == "清除数据":
         if not is_bot_admin(user.id):
             return
         stats = db.clear_today_transactions(chat_id)
-        in_c = stats.get("in", {}).get("count", 0)
-        in_u = stats.get("in", {}).get("usdt", 0.0)
-        out_c = stats.get("out", {}).get("count", 0)
-        out_u = stats.get("out", {}).get("usdt", 0.0)
-        send_c = stats.get("send", {}).get("count", 0)
-        send_u = stats.get("send", {}).get("usdt", 0.0)
-        total = in_c + out_c + send_c
+        in_count = stats.get("in", {}).get("count", 0)
+        in_usdt = stats.get("in", {}).get("usdt", 0)
+        out_count = stats.get("out", {}).get("count", 0)
+        out_usdt = stats.get("out", {}).get("usdt", 0)
+        send_count = stats.get("send", {}).get("count", 0)
+        send_usdt = stats.get("send", {}).get("usdt", 0)
+
+        total = in_count + out_count + send_count
         if total == 0:
-            await update.message.reply_text("ℹ️ 今日暂无数据，无需清除")
-        else:
-            msg = (
-                "✅ 已清除今日数据（00:00 至现在）\n\n"
-                f"📥 入金：{in_c} 笔 / {in_u:.2f} USDT\n"
-                f"📤 出金：{out_c} 笔 / {out_u:.2f} USDT\n"
-                f"💰 下发：{send_c} 笔 / {send_u:.2f} USDT"
+            await update.message.reply_text(
+                "ℹ️ 今日 00:00 之后暂无数据，无需清除。"
             )
-            await update.message.reply_text(msg)
+        else:
+            msg = [
+                "✅ 已清除今日数据（00:00 至现在）\n",
+                f"📥 入金：{in_count} 笔（{in_usdt:.2f} USDT）",
+                f"📤 出金：{out_count} 笔（{out_usdt:.2f} USDT）",
+                f"💰 下发：{send_count} 笔（{send_usdt:.2f} USDT）",
+            ]
+            await update.message.reply_text("\n".join(msg))
+
         await send_summary_with_button(update, chat_id, user.id)
         return
 
-    # 设置费率 / 汇率
+    # ----- 设置费率 / 汇率 -----
     if text.startswith(("设置入金费率", "设置入金汇率", "设置出金费率", "设置出金汇率")):
         if not is_bot_admin(user.id):
             return
         try:
-            if text.startswith("设置入金费率"):
+            if "入金费率" in text:
                 val = float(text.replace("设置入金费率", "").strip()) / 100.0
                 db.update_group_config(chat_id, in_rate=val)
                 await update.message.reply_text(f"✅ 已设置默认入金费率为 {val*100:.0f}%")
-            elif text.startswith("设置入金汇率"):
+            elif "入金汇率" in text:
                 val = float(text.replace("设置入金汇率", "").strip())
                 db.update_group_config(chat_id, in_fx=val)
                 await update.message.reply_text(f"✅ 已设置默认入金汇率为 {val}")
-            elif text.startswith("设置出金费率"):
+            elif "出金费率" in text:
                 val = float(text.replace("设置出金费率", "").strip()) / 100.0
                 db.update_group_config(chat_id, out_rate=val)
                 await update.message.reply_text(f"✅ 已设置默认出金费率为 {val*100:.0f}%")
-            elif text.startswith("设置出金汇率"):
+            elif "出金汇率" in text:
                 val = float(text.replace("设置出金汇率", "").strip())
                 db.update_group_config(chat_id, out_fx=val)
                 await update.message.reply_text(f"✅ 已设置默认出金汇率为 {val}")
         except ValueError:
-            await update.message.reply_text("❌ 格式错误，请输入数字，例如：设置入金费率 20")
+            await update.message.reply_text("❌ 格式错误，请输入有效数字")
         return
 
-    # +0 查看账单
-    if text == "+0":
-        await send_summary_with_button(update, chat_id, user.id)
-        return
-
-    # ---------- 入金 ----------
+    # ----- 入金 -----
     if text.startswith("+"):
         if not is_bot_admin(user.id):
             return
@@ -678,11 +717,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         config = db.get_group_config(chat_id)
-        rate = float(config.get("in_rate", 0.0))
-        fx = float(config.get("in_fx", 0.0))
+        rate = float(config.get("in_rate", 0))
+        fx = float(config.get("in_fx", 0))
 
         if fx == 0:
-            await update.message.reply_text("⚠️ 请先设置入金费率和汇率")
+            await update.message.reply_text("⚠️ 请先设置费率和汇率")
             return
 
         amt_f = float(amt)
@@ -715,7 +754,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.update_transaction_message_id(txn_id, msg.message_id)
         return
 
-    # ---------- 出金 ----------
+    # ----- 出金 -----
     if text.startswith("-"):
         if not is_bot_admin(user.id):
             return
@@ -724,11 +763,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         config = db.get_group_config(chat_id)
-        rate = float(config.get("out_rate", 0.0))
-        fx = float(config.get("out_fx", 0.0))
+        rate = float(config.get("out_rate", 0))
+        fx = float(config.get("out_fx", 0))
 
         if fx == 0:
-            await update.message.reply_text("⚠️ 请先设置出金费率和汇率")
+            await update.message.reply_text("⚠️ 请先设置费率和汇率")
             return
 
         amt_f = float(amt)
@@ -761,55 +800,66 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.update_transaction_message_id(txn_id, msg.message_id)
         return
 
-    # ---------- 下发 USDT ----------
+    # ----- 下发 USDT（正负皆可） -----
     if text.startswith("下发"):
         if not is_bot_admin(user.id):
             return
         try:
             usdt_str = text.replace("下发", "").strip()
+            if not usdt_str:
+                await update.message.reply_text(
+                    "❌ 请输入金额，例如：下发35.04 或 下发-35.04"
+                )
+                return
+
             usdt_val = float(usdt_str)
+            usdt_val = round2(usdt_val)  # 统一两位小数
+
+            # amount 存绝对值，usdt 存有符号值
+            txn_id = db.add_transaction(
+                chat_id=chat_id,
+                transaction_type="send",
+                amount=Decimal(str(abs(usdt_val))),
+                rate=Decimal("0"),
+                fx=Decimal("0"),
+                usdt=Decimal(str(usdt_val)),  # ✅ 有正负号
+                timestamp=ts,
+                country="通用",
+                operator_id=user.id,
+                operator_name=user.first_name,
+            )
+
+            if usdt_val > 0:
+                append_log(
+                    log_path(chat_id, None, dstr),
+                    f"[下发USDT] 时间:{ts} 金额:{usdt_val} USDT",
+                )
+            else:
+                append_log(
+                    log_path(chat_id, None, dstr),
+                    f"[撤销下发] 时间:{ts} 金额:{abs(usdt_val)} USDT",
+                )
+
+            msg = await send_summary_with_button(update, chat_id, user.id)
+            if msg and txn_id:
+                db.update_transaction_message_id(txn_id, msg.message_id)
+
         except ValueError:
-            await update.message.reply_text("❌ 格式错误，请输入：下发35.04 或 下发-35.04")
-            return
-
-        txn_id = db.add_transaction(
-            chat_id=chat_id,
-            transaction_type="send",
-            amount=Decimal(str(abs(usdt_val))),
-            rate=Decimal("0"),
-            fx=Decimal("0"),
-            usdt=Decimal(str(usdt_val)),
-            timestamp=ts,
-            country="通用",
-            operator_id=user.id,
-            operator_name=user.first_name,
-        )
-
-        if usdt_val > 0:
-            append_log(
-                log_path(chat_id, None, dstr),
-                f"[下发USDT] 时间:{ts} 金额:{usdt_val} USDT",
-            )
-        else:
-            append_log(
-                log_path(chat_id, None, dstr),
-                f"[撤销下发] 时间:{ts} 金额:{abs(usdt_val)} USDT",
+            await update.message.reply_text(
+                "❌ 格式错误，请输入有效的数字\n例如：下发35.04 或 下发-35.04"
             )
 
-        msg = await send_summary_with_button(update, chat_id, user.id)
-        if msg and txn_id:
-            db.update_transaction_message_id(txn_id, msg.message_id)
         return
 
-    # ---------- 更多记录 ----------
-    if text in ("更多记录", "查看更多记录", "更多账单", "显示历史账单"):
+    # ----- 更多记录 -----
+    if text in ["更多记录", "查看更多记录", "更多账单", "显示历史账单"]:
         await update.message.reply_text(render_full_summary(chat_id))
         return
 
-    # 其他文本忽略（不回）
 
-
-# ========== Flask 路由 ==========
+# =========================================================
+# Flask 路由
+# =========================================================
 
 
 @app.route("/")
@@ -824,15 +874,16 @@ def health():
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
+    """Telegram Webhook 接收入口"""
     global telegram_app, bot_loop
+    if telegram_app is None or bot_loop is None:
+        return "Bot not ready", 503
     try:
-        data = request.get_json(force=True)
-        update = Update.de_json(data, telegram_app.bot)  # type: ignore
-
-        if bot_loop and telegram_app:
-            asyncio.run_coroutine_threadsafe(
-                telegram_app.process_update(update), bot_loop
-            )
+        update_data = request.get_json(force=True)
+        update = Update.de_json(update_data, telegram_app.bot)
+        asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), bot_loop
+        )
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook 处理错误: {e}")
@@ -842,12 +893,11 @@ def webhook():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    info = session.get("user_info")
-    chat_id = info["chat_id"]
-    user_id = info["user_id"]
+    user_info = session.get("user_info")
+    chat_id = user_info["chat_id"]
+    user_id = user_info["user_id"]
 
     config = db.get_group_config(chat_id)
-
     display_config = {
         "deposit_fee_rate": float(config.get("in_rate", 0)) * 100,
         "deposit_fx": float(config.get("in_fx", 0)),
@@ -855,9 +905,7 @@ def dashboard():
         "withdrawal_fx": float(config.get("out_fx", 0)),
     }
 
-    is_owner = False
-    if OWNER_ID and OWNER_ID.isdigit():
-        is_owner = user_id == int(OWNER_ID)
+    is_owner = OWNER_ID and OWNER_ID.isdigit() and user_id == int(OWNER_ID)
 
     return render_template(
         "dashboard.html",
@@ -871,45 +919,36 @@ def dashboard():
 @app.route("/api/transactions")
 @login_required
 def api_transactions():
-    info = session.get("user_info")
-    chat_id = info["chat_id"]
+    user_info = session.get("user_info")
+    chat_id = user_info["chat_id"]
 
     txns = db.get_today_transactions(chat_id)
+
     records = []
-
     for t in txns:
-        t_type = t["transaction_type"]
-        if t_type == "in":
-            mapped = "deposit"
-        elif t_type == "out":
-            mapped = "withdrawal"
-        elif t_type == "send":
-            mapped = "disbursement"
-        else:
-            mapped = "unknown"
-
-        created_at = t.get("created_at")
-        ts_num = created_at.timestamp() if created_at else 0
-
         records.append(
             {
                 "time": t["timestamp"],
-                "type": mapped,
+                "type": {
+                    "in": "deposit",
+                    "out": "withdrawal",
+                    "send": "disbursement",
+                }.get(t["transaction_type"], "unknown"),
                 "amount": float(t["amount"]),
                 "fee_rate": float(t["rate"]) * 100,
                 "exchange_rate": float(t["fx"]),
                 "usdt": float(t["usdt"]),
-                "operator": t.get("operator_name") or "未知",
+                "operator": t.get("operator_name", "未知"),
                 "message_id": t.get("message_id"),
-                "timestamp": ts_num,
+                "timestamp": t["created_at"].timestamp()
+                if t.get("created_at")
+                else 0,
             }
         )
 
     stats = {
         "total_deposit": sum(r["amount"] for r in records if r["type"] == "deposit"),
-        "total_deposit_usdt": sum(
-            r["usdt"] for r in records if r["type"] == "deposit"
-        ),
+        "total_deposit_usdt": sum(r["usdt"] for r in records if r["type"] == "deposit"),
         "total_withdrawal": sum(
             r["amount"] for r in records if r["type"] == "withdrawal"
         ),
@@ -934,12 +973,13 @@ def api_transactions():
         if op not in stats["by_operator"]:
             stats["by_operator"][op] = {
                 "deposit_count": 0,
-                "deposit_usdt": 0,
+                "deposit_usdt": 0.0,
                 "withdrawal_count": 0,
-                "withdrawal_usdt": 0,
+                "withdrawal_usdt": 0.0,
                 "disbursement_count": 0,
-                "disbursement_usdt": 0,
+                "disbursement_usdt": 0.0,
             }
+
         s = stats["by_operator"][op]
         if r["type"] == "deposit":
             s["deposit_count"] += 1
@@ -957,10 +997,11 @@ def api_transactions():
 @app.route("/api/rollback", methods=["POST"])
 @login_required
 def api_rollback():
-    info = session.get("user_info")
-    user_id = info["user_id"]
+    user_info = session.get("user_info")
+    user_id = user_info["user_id"]
 
-    if not (OWNER_ID and OWNER_ID.isdigit() and user_id == int(OWNER_ID)):
+    is_owner = OWNER_ID and OWNER_ID.isdigit() and user_id == int(OWNER_ID)
+    if not is_owner:
         return jsonify({"success": False, "error": "无权限"}), 403
 
     data = request.json or {}
@@ -975,14 +1016,17 @@ def api_rollback():
         return jsonify({"success": False, "error": "未找到该交易记录"}), 404
 
 
-# ========== Telegram Bot 初始化 & 事件循环 ==========
+# =========================================================
+# Bot 初始化 & 事件循环线程
+# =========================================================
 
 
 async def setup_telegram_bot():
     global telegram_app
-    logger.info("🤖 初始化 Telegram Bot Application...")
 
+    logger.info("🤖 初始化 Telegram Bot Application...")
     telegram_app = Application.builder().token(BOT_TOKEN).build()
+
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(
         MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_text)
@@ -991,9 +1035,9 @@ async def setup_telegram_bot():
     await telegram_app.initialize()
 
     if WEBHOOK_URL:
-        url = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
-        logger.info(f"🔗 设置 Webhook: {url}")
-        await telegram_app.bot.set_webhook(url=url)
+        webhook_path = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
+        logger.info(f"🔗 设置 Webhook: {webhook_path}")
+        await telegram_app.bot.set_webhook(url=webhook_path)
         logger.info("✅ Webhook 已设置")
     else:
         logger.warning("⚠️ 未设置 WEBHOOK_URL，Webhook 不会生效")
@@ -1005,7 +1049,6 @@ def run_bot_loop():
     global bot_loop
     bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(bot_loop)
-
     try:
         bot_loop.run_until_complete(setup_telegram_bot())
         bot_loop.run_forever()
@@ -1015,16 +1058,17 @@ def run_bot_loop():
         bot_loop.close()
 
 
-# ========== 应用初始化 & 启动 ==========
-
-
 def init_app():
     logger.info("=" * 50)
     logger.info("🚀 启动 Telegram Bot + Web Dashboard")
     logger.info("=" * 50)
 
-    db.init_database()
-    logger.info("✅ Database initialized successfully")
+    try:
+        db.init_database()
+        logger.info("✅ 数据库初始化完成")
+    except Exception as e:
+        logger.error(f"❌ 数据库初始化失败: {e}")
+        raise
 
     if OWNER_ID and OWNER_ID.isdigit():
         db.add_admin(int(OWNER_ID), None, "Owner", is_owner=True)
@@ -1034,34 +1078,21 @@ def init_app():
     logger.info("=" * 50)
 
 
-if __name__ == "__main__":
-    print("🚀 启动Telegram财务Bot (PostgreSQL版本)...")
-    print("📋 环境变量检查：")
-    print(f"   PORT={PORT}")
-    print(f"   DATABASE_URL={'已设置' if os.getenv('DATABASE_URL') else '未设置'}")
-    print(f"   TELEGRAM_BOT_TOKEN={'已设置' if BOT_TOKEN else '未设置'}")
-    print(f"   OWNER_ID={OWNER_ID}")
-    print(f"   WEBHOOK_URL={WEBHOOK_URL or '未设置'}")
-    print(f"   SESSION_SECRET={'已设置' if SESSION_SECRET else '未设置'}\n")
+# =========================================================
+# 主入口
+# =========================================================
 
-    print("🗄️  初始化数据库...\n")
+if __name__ == "__main__":
     init_app()
 
-    print("🌐 启动Flask应用（Bot + Web Dashboard）...")
-    print(f"   - 应用 PID: {os.getpid()}\n")
-    print("✅ 应用已启动")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"📊 Web Dashboard: http://0.0.0.0:{PORT}")
-    print("🤖 Telegram Bot: Webhook模式")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-
-    print("🔄 进入监控循环（每30秒检查一次）...")
-
-    # 启动 Bot 线程
     logger.info("🔄 启动 Bot 事件循环线程...")
-    bot_thread = threading.Thread(target=run_bot_loop, daemon=True)
-    bot_thread.start()
+    t = threading.Thread(target=run_bot_loop, daemon=True)
+    t.start()
 
-    # 启动 Flask
     logger.info(f"🌐 Flask 应用启动在端口: {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+    )
