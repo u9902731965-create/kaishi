@@ -887,77 +887,54 @@ def api_rollback():
     return jsonify({"success": False, "error": "未找到该交易记录"}), 404
 
 
-# ========== Bot 初始化 & 事件循环 ==========
-
-
-async def setup_telegram_bot():
-    global telegram_app
-
-    logger.info("🤖 初始化 Telegram Bot Application...")
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(
-        MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_text)
-    )
-
-    await telegram_app.initialize()
-
-    if WEBHOOK_URL:
-        webhook_path = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
-        logger.info(f"🔗 设置 Webhook: {webhook_path}")
-        await telegram_app.bot.set_webhook(url=webhook_path)
-        logger.info("✅ Webhook 已设置")
-    else:
-        logger.warning("⚠️ 未设置 WEBHOOK_URL，Webhook 不会生效")
-
-    logger.info("✅ Telegram Bot 初始化完成")
-
-
-def run_bot_loop():
-    global bot_loop
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
-    try:
-        bot_loop.run_until_complete(setup_telegram_bot())
-        bot_loop.run_forever()
-    except Exception as e:
-        logger.error(f"Bot 事件循环错误: {e}")
-    finally:
-        bot_loop.close()
-
+# ========= 应用初始化函数 =========
 
 def init_app():
+    """初始化数据库、管理员、Webhook 等"""
     logger.info("=" * 50)
     logger.info("🚀 启动 Telegram Bot + Web Dashboard")
     logger.info("=" * 50)
 
-    db.init_database()
-    logger.info("✅ 数据库初始化完成")
+    # 1. 初始化数据库
+    try:
+        db.init_database()
+        # ✅ 只保留最近 N 天的交易记录（目前是 30 天）
+        db.cleanup_old_transactions(30)
+        logger.info("✅ 数据库初始化完成")
+    except Exception as e:
+        logger.exception("❌ 数据库初始化失败: %s", e)
+        raise
 
-    db.delete_old_transactions(30)   # ✨ 只保留最近 30 天的数据
-
+    # 2. 初始化 OWNER 管理员
     if OWNER_ID and OWNER_ID.isdigit():
-        db.add_admin(int(OWNER_ID), None, "Owner", is_owner=True)
-        logger.info(f"✅ OWNER 已设置为管理员: {OWNER_ID}")
+        try:
+            db.add_admin(int(OWNER_ID), None, "Owner", is_owner=True)
+            logger.info(f"✅ OWNER 已设置为管理员: {OWNER_ID}")
+        except Exception as e:
+            logger.exception("❌ 初始化 OWNER 管理员失败: %s", e)
+    else:
+        logger.warning("⚠️ 未设置 OWNER_ID，建议在环境变量中配置群主的 Telegram ID")
 
     logger.info("✅ 应用初始化完成")
     logger.info("=" * 50)
 
-
-# ========== 主入口 ==========
-
-if __name__ == "__main__":
-    init_app()
-
+    # 3. 启动 Bot 事件循环线程
     logger.info("🔄 启动 Bot 事件循环线程...")
     t = threading.Thread(target=run_bot_loop, daemon=True)
     t.start()
 
+    # 4. 如果设置了 WEBHOOK_URL，则配置 Telegram Webhook
+    if WEBHOOK_URL:
+        logger.info("🤖 初始化 Telegram Bot Application...")
+        # 注意：run_bot_loop 里已经创建了 Application 并设置 webhook，
+        # 这里只是打印一下提示信息，方便查日志。
+    else:
+        logger.warning("⚠️ 未设置 WEBHOOK_URL，Webhook 不会生效，Bot 无法接收消息")
+
+
+# ========= 程序入口 =========
+
+if __name__ == "__main__":
+    init_app()
     logger.info(f"🌐 Flask 应用启动在端口: {PORT}")
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False,
-    )
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
