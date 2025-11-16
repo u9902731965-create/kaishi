@@ -8,6 +8,7 @@ import os
 import re
 import hmac
 import math
+import json
 import hashlib
 import logging
 import asyncio
@@ -16,6 +17,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import wraps
+from typing import Optional
 
 from dotenv import load_dotenv
 from flask import (
@@ -35,7 +37,6 @@ from telegram.ext import (
     filters,
 )
 
-import pytz
 import database as db
 
 # ========== 环境 & Flask 初始化 ==========
@@ -71,8 +72,8 @@ LOG_DIR = DATA_DIR / "logs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-telegram_app: Application | None = None
-bot_loop: asyncio.AbstractEventLoop | None = None
+telegram_app: Optional[Application] = None
+bot_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # ========== 工具函数 ==========
 
@@ -114,12 +115,16 @@ def to_superscript(num: int) -> str:
 
 def now_ts() -> str:
     """当前北京时间 HH:MM"""
+    import pytz
+
     tz = pytz.timezone("Asia/Shanghai")
     return datetime.now(tz).strftime("%H:%M")
 
 
 def today_str() -> str:
     """当前北京时间 YYYY-MM-DD"""
+    import pytz
+
     tz = pytz.timezone("Asia/Shanghai")
     return datetime.now(tz).strftime("%Y-%m-%d")
 
@@ -142,15 +147,65 @@ def append_log(path: Path, text: str):
         f.write(text.strip() + "\n")
 
 
+# ======= 新版：金额 + 国家解析（支持 1万 / 1.5亿 等） =======
+
 def parse_amount_and_country(text: str):
-    """解析 +10000 / 日本 形式"""
-    m = re.match(r"^[\+\-]\s*([0-9]+(?:\.[0-9]+)?)", text.strip())
+    """
+    解析金额 + 国家
+    支持以下格式：
+        +10000
+        +1万
+        +1.5万
+        +2亿
+        +1.2万 / 日本
+        -5000 / 韩国
+    """
+
+    raw = text.strip()
+
+    # 先处理开头的 + 或 -
+    m = re.match(r"^([\+\-])\s*(.+)$", raw)
     if not m:
         return None, None
-    amount = float(m.group(1))
-    m2 = re.search(r"/\s*([^\s]+)$", text)
-    country = m2.group(1) if m2 else "通用"
-    return amount, country
+
+    sign = 1 if m.group(1) == "+" else -1
+    body = m.group(2).strip()
+
+    # 判断是否有国家
+    if "/" in body:
+        num_part, country = map(str.strip, body.rsplit("/", 1))
+    else:
+        num_part, country = body, "通用"
+
+    # 中文单位换算
+    def convert_cn_amount(s: str) -> Optional[float]:
+        """
+        将 “1万”“2.5万”“3亿”“1200” 转成 float
+        """
+        # 去掉逗号，如 1,200,000
+        s = s.replace(",", "")
+
+        unit = 1
+        if s.endswith("千"):
+            unit = 1000
+            s = s[:-1]
+        elif s.endswith("万"):
+            unit = 10000
+            s = s[:-1]
+        elif s.endswith("亿"):
+            unit = 100000000
+            s = s[:-1]
+
+        try:
+            return float(s) * unit
+        except Exception:
+            return None
+
+    amount = convert_cn_amount(num_part)
+    if amount is None:
+        return None, None
+
+    return sign * amount, country
 
 
 def is_bot_admin(user_id: int) -> bool:
@@ -377,7 +432,7 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
     return msg
 
 
-# ========== Telegram 指令 & 消息处理 ==========
+# ========== Telegram 处理 ==========
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -387,8 +442,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🤖 你好，我是财务记账机器人。\n\n"
         "📊 记账操作：\n"
-        "  入金：+10000 或 +10000 / 日本\n"
-        "  出金：-10000 或 -10000 / 日本\n"
+        "  入金：+10000 或 +1万 或 +10000 / 日本\n"
+        "  出金：-10000 或 -1万 或 -10000 / 日本\n"
         "  查看账单：+0 或 更多记录\n\n"
         "💰 USDT 下发（仅管理员）：\n"
         "  下发35.04（记录下发并扣除应下发）\n"
@@ -416,16 +471,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
     user = update.effective_user
     chat = update.effective_chat
     chat_id = chat.id
     text = (update.message.text or update.message.caption or "").strip()
-    if not text:
-        return
-
     ts = now_ts()
     dstr = today_str()
 
@@ -449,6 +498,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_summary_with_button(update, chat_id, user.id)
         return
 
+    # 管理员相关命令，从这里开始都需要权限
     # 显示机器人管理员
     if text == "显示机器人管理员":
         if not is_bot_admin(user.id):
@@ -731,50 +781,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ========== Telegram Application 事件循环 ==========
+# ========== 构建 Telegram Application & 事件循环 ==========
+
+
+def build_telegram_app() -> Application:
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text)
+    )
+    return application
 
 
 def run_bot_loop():
-    """在独立线程中运行 Telegram Application"""
+    """在单独线程中启动 Telegram Application（Webhook 模式）"""
     global telegram_app, bot_loop
 
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    bot_loop = loop
 
-    async def _init_app():
-        global telegram_app
+    application = build_telegram_app()
+    telegram_app = application
+
+    async def _init():
         logger.info("🤖 初始化 Telegram Bot Application...")
-        telegram_app = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
+        await application.initialize()
 
-        telegram_app.add_handler(CommandHandler("start", cmd_start))
-        telegram_app.add_handler(MessageHandler(filters.ALL, handle_text))
+        # 先删除旧 webhook，防止冲突
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.warning(f"删除旧 Webhook 失败: {e}")
 
-        # 设置 Webhook
         if WEBHOOK_URL:
             webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
             logger.info(f"🔗 设置 Webhook: {webhook_url}")
-            await telegram_app.bot.set_webhook(url=webhook_url)
+            await application.bot.set_webhook(webhook_url)
             logger.info("✅ Webhook 已设置")
         else:
-            logger.warning("⚠️ 未设置 WEBHOOK_URL，Bot 无法通过 Webhook 收到消息")
+            logger.warning("⚠️ 未设置 WEBHOOK_URL，Webhook 不会生效，Bot 无法接收消息")
 
-        await telegram_app.initialize()
-        await telegram_app.start()
+        await application.start()
         logger.info("✅ Telegram Bot 初始化完成")
 
-    try:
-        bot_loop.run_until_complete(_init_app())
-        bot_loop.run_forever()
-    except Exception as e:
-        logger.exception("❌ Telegram Bot 事件循环异常: %s", e)
-    finally:
-        if telegram_app:
-            bot_loop.run_until_complete(telegram_app.stop())
-            bot_loop.run_until_complete(telegram_app.shutdown())
+    loop.run_until_complete(_init())
+    loop.run_forever()
 
 
 # ========== Flask 路由 ==========
@@ -936,28 +988,20 @@ def api_rollback():
 
 # ========= 应用初始化函数 =========
 
-
-def log_env_info():
-    logger.info("📋 环境变量检查：")
-    logger.info(f"   PORT={PORT}")
-    logger.info(
-        f"   DATABASE_URL={'已设置' if os.getenv('DATABASE_URL') else '未设置'}"
-    )
-    logger.info(f"   TELEGRAM_BOT_TOKEN={'已设置' if BOT_TOKEN else '未设置'}")
-    logger.info(f"   OWNER_ID={OWNER_ID or '未设置'}")
-    logger.info(f"   WEBHOOK_URL={WEBHOOK_URL or '未设置'}")
-    logger.info(
-        f"   SESSION_SECRET={'已设置' if SESSION_SECRET else '未设置'}"
-    )
-
-
 def init_app():
     """初始化数据库、管理员、Webhook 等"""
     logger.info("=" * 50)
     logger.info("🚀 启动 Telegram Bot + Web Dashboard")
     logger.info("=" * 50)
 
-    log_env_info()
+    # 打印环境变量概况，方便排查
+    logger.info("📋 环境变量检查：")
+    logger.info(f"   PORT={PORT}")
+    logger.info(f"   DATABASE_URL={'已设置' if os.getenv('DATABASE_URL') else '未设置'}")
+    logger.info("   TELEGRAM_BOT_TOKEN=已设置")
+    logger.info(f"   OWNER_ID={OWNER_ID}")
+    logger.info(f"   WEBHOOK_URL={WEBHOOK_URL}")
+    logger.info(f"   SESSION_SECRET={'已设置' if SESSION_SECRET else '未设置'}")
 
     # 1. 初始化数据库
     try:
