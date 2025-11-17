@@ -8,15 +8,15 @@ import os
 import re
 import hmac
 import math
+import json
+import hashlib
 import logging
 import asyncio
 import threading
-import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import wraps
-from typing import Optional
 
 from dotenv import load_dotenv
 from flask import (
@@ -35,8 +35,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.request import HTTPXRequest
-from telegram.error import TimedOut
+from telegram.error import TimedOut, NetworkError  # ⬅️ 新增：捕获超时 / 网络异常
 
 import database as db
 
@@ -73,8 +72,8 @@ LOG_DIR = DATA_DIR / "logs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-telegram_app: Optional[Application] = None
-bot_loop: Optional[asyncio.AbstractEventLoop] = None
+telegram_app: Application | None = None
+bot_loop: asyncio.AbstractEventLoop | None = None
 
 # ========== 工具函数 ==========
 
@@ -148,61 +147,25 @@ def append_log(path: Path, text: str):
         f.write(text.strip() + "\n")
 
 
-def _parse_chinese_unit(num_str: str) -> float:
-    """
-    支持 “1万”、“2.5万” 这样的写法。
-    如果没有“万”，按普通数字解析。
-    """
-    num_str = num_str.strip()
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)(万)?$", num_str)
-    if not m:
-        return float(num_str)
-    value = float(m.group(1))
-    if m.group(2):  # 有 “万”
-        value *= 10000.0
-    return value
-
-
 def parse_amount_and_country(text: str):
     """
-    解析 +10000 / 日本、+1万 / 日本 这样的格式。
-    返回 (amount, country)
+    解析 +10000 / +1万 / -5000 / -0.5万 / 日本 形式
+    只返回数值本身（始终为正数）和国家，正负由外层根据首字符 +/- 判断
     """
-    text = text.strip()
-    if not text:
+    s = text.strip()
+    # 提取数字 + 可选“万”
+    m = re.match(r"^[\+\-]\s*([0-9]+(?:\.[0-9]+)?)(万)?", s)
+    if not m:
         return None, None
 
-    # 先取出 + 或 -
-    sign = 1.0
-    if text[0] == "+":
-        sign = 1.0
-        body = text[1:]
-    elif text[0] == "-":
-        sign = -1.0
-        body = text[1:]
-    else:
-        body = text
+    num = float(m.group(1))
+    if m.group(2):  # 带 “万”
+        num *= 10000.0
 
-    # 拿到 “金额部分” 和 “国家部分”
-    # 例如 "10000 / 日本" 或 "1万/日本"
-    if "/" in body:
-        amount_part, country_part = body.split("/", 1)
-        country = country_part.strip() or "通用"
-    else:
-        amount_part = body
-        country = "通用"
-
-    amount_part = amount_part.strip()
-    if not amount_part:
-        return None, None
-
-    try:
-        amount_abs = _parse_chinese_unit(amount_part)
-    except ValueError:
-        return None, None
-
-    amount = sign * amount_abs
-    return amount, country
+    # 国家
+    m2 = re.search(r"/\s*([^\s]+)$", s)
+    country = m2.group(1) if m2 else "通用"
+    return num, country
 
 
 def is_bot_admin(user_id: int) -> bool:
@@ -412,22 +375,30 @@ def render_full_summary(chat_id: int) -> str:
     return "\n".join(lines)
 
 
-async def safe_reply(message, text: str, reply_markup=None):
+# ========== 安全发消息封装（带重试） ==========
+
+async def safe_send_message(bot, chat_id: int, text: str, reply_markup=None):
     """
-    给群里回复消息，加一层超时重试的保护。
+    带重试的安全发消息封装：
+    - 第一次超时会等 3 秒再重试一次
+    - 第二次再超时就放弃，只记录日志，避免程序崩溃
     """
-    try:
-        return await message.reply_text(text, reply_markup=reply_markup)
-    except TimedOut:
-        logger.warning("发送消息超时，准备重试一次 ...")
+    for attempt in range(2):
         try:
-            return await message.reply_text(text, reply_markup=reply_markup)
+            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         except TimedOut:
-            logger.error("重试发送消息仍然超时，放弃本次发送")
-            return None
-    except Exception as e:
-        logger.exception(f"发送消息出现异常: {e}")
-        return None
+            if attempt == 0:
+                logger.warning("发送消息超时，准备重试一次 ...")
+                await asyncio.sleep(3)
+            else:
+                logger.error("重试发送消息仍然超时，放弃本次发送")
+        except NetworkError as e:
+            logger.error(f"发送消息网络错误：{e}")
+            break
+        except Exception as e:
+            logger.exception(f"发送消息出现未知错误：{e}")
+            break
+    return None
 
 
 async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
@@ -440,7 +411,8 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
             [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
         )
 
-    msg = await safe_reply(update.message, text, reply_markup=markup)
+    bot = update.get_bot()
+    msg = await safe_send_message(bot, chat_id, text, reply_markup=markup)
     return msg
 
 
@@ -450,12 +422,13 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
+    chat_id = chat.id
 
     help_text = (
         "🤖 你好，我是财务记账机器人。\n\n"
         "📊 记账操作：\n"
-        "  入金：+10000 或 +10000 / 日本，或者 +1万 / 日本\n"
-        "  出金：-10000 或 -10000 / 日本，或者 -1万 / 日本\n"
+        "  入金：+10000 或 +10000 / 日本，也可以用 +1万 / +1.5万\n"
+        "  出金：-10000 或 -10000 / 日本，也可以用 -1万 / -0.5万\n"
         "  查看账单：+0 或 更多记录\n\n"
         "💰 USDT 下发（仅管理员）：\n"
         "  下发35.04（记录下发并扣除应下发）\n"
@@ -479,13 +452,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         db.add_private_chat_user(user.id, user.username, user.first_name)
 
-    await update.message.reply_text(help_text)
+    await safe_send_message(update.get_bot(), chat_id, help_text)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     chat_id = chat.id
+    bot = update.get_bot()
     text = (update.message.text or update.message.caption or "").strip()
     ts = now_ts()
     dstr = today_str()
@@ -517,7 +491,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         admins = db.get_all_admins()
         if not admins:
-            await update.message.reply_text("👥 当前没有设置机器人管理员")
+            await safe_send_message(bot, chat_id, "👥 当前没有设置机器人管理员")
             return
         lines = ["👥 机器人管理员列表：\n"]
         for a in admins:
@@ -528,7 +502,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = " 🔱" if is_owner else ""
             lines.append(f"• {name} (@{username}){status}")
             lines.append(f"  ID: {uid}")
-        await update.message.reply_text("\n".join(lines))
+        await safe_send_message(bot, chat_id, "\n".join(lines))
         return
 
     # 设置/删除机器人管理员
@@ -536,12 +510,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_bot_admin(user.id):
             return
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ 请回复要设置为管理员的用户消息")
+            await safe_send_message(bot, chat_id, "❌ 请回复要设置为管理员的用户消息")
             return
         target = update.message.reply_to_message.from_user
         db.add_admin(target.id, target.username, target.first_name, is_owner=False)
-        await update.message.reply_text(
-            f"✅ 已将 {target.first_name} 设置为机器人管理员\n🆔 User ID: {target.id}"
+        await safe_send_message(
+            bot,
+            chat_id,
+            f"✅ 已将 {target.first_name} 设置为机器人管理员\n🆔 User ID: {target.id}",
         )
         return
 
@@ -549,11 +525,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_bot_admin(user.id):
             return
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ 请回复要删除的管理员消息")
+            await safe_send_message(bot, chat_id, "❌ 请回复要删除的管理员消息")
             return
         target = update.message.reply_to_message.from_user
         db.remove_admin(target.id)
-        await update.message.reply_text(f"✅ 已移除 {target.first_name} 的管理员权限")
+        await safe_send_message(bot, chat_id, f"✅ 已移除 {target.first_name} 的管理员权限")
         return
 
     # 撤销
@@ -561,20 +537,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_bot_admin(user.id):
             return
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ 请回复要撤销的账单消息")
+            await safe_send_message(bot, chat_id, "❌ 请回复要撤销的账单消息")
             return
         msg_id = update.message.reply_to_message.message_id
         deleted = db.delete_transaction_by_message_id(msg_id)
         if deleted:
-            await update.message.reply_text(
+            await safe_send_message(
+                bot,
+                chat_id,
                 f"✅ 已撤销交易\n"
                 f"类型: {deleted['transaction_type']}\n"
                 f"金额: {deleted['amount']}\n"
-                f"USDT: {deleted['usdt']}"
+                f"USDT: {deleted['usdt']}",
             )
             await send_summary_with_button(update, chat_id, user.id)
         else:
-            await update.message.reply_text("❌ 未找到该消息对应的交易记录")
+            await safe_send_message(bot, chat_id, "❌ 未找到该消息对应的交易记录")
         return
 
     # 重置默认值
@@ -588,10 +566,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out_rate=0.02,
             out_fx=137,
         )
-        await update.message.reply_text(
+        await safe_send_message(
+            bot,
+            chat_id,
             "✅ 已重置为默认值\n\n"
             "📥 入金：费率 10%  汇率 153\n"
-            "📤 出金：费率 2%   汇率 137"
+            "📤 出金：费率 2%   汇率 137",
         )
         await send_summary_with_button(update, chat_id, user.id)
         return
@@ -609,8 +589,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_u = stats.get("send", {}).get("usdt", 0)
         total = in_c + out_c + send_c
         if total == 0:
-            await update.message.reply_text(
-                "ℹ️ 今日 00:00 之后暂无数据， 无需清除。"
+            await safe_send_message(
+                bot,
+                chat_id,
+                "ℹ️ 今日 00:00 之后暂无数据， 无需清除。",
             )
         else:
             lines = [
@@ -619,7 +601,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📤 出账：{out_c} 笔（{out_u:.2f} USDT）",
                 f"💰 下发：{send_c} 笔（{send_u:.2f} USDT）",
             ]
-            await update.message.reply_text("\n".join(lines))
+            await safe_send_message(bot, chat_id, "\n".join(lines))
         await send_summary_with_button(update, chat_id, user.id)
         return
 
@@ -629,10 +611,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         name = text.replace("设置账单名称", "", 1).strip()
         if not name:
-            await update.message.reply_text("❌ 请输入新的账单名称，例如：设置账单名称 AA全球国际支付")
+            await safe_send_message(
+                bot,
+                chat_id,
+                "❌ 请输入新的账单名称，例如：设置账单名称 AA全球国际支付",
+            )
             return
         db.update_group_config(chat_id, group_name=name)
-        await update.message.reply_text(f"✅ 已将账单名称设置为：{name}")
+        await safe_send_message(bot, chat_id, f"✅ 已将账单名称设置为：{name}")
         await send_summary_with_button(update, chat_id, user.id)
         return
 
@@ -644,21 +630,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "入金费率" in text:
                 val = float(text.replace("设置入金费率", "").strip()) / 100.0
                 db.update_group_config(chat_id, in_rate=val)
-                await update.message.reply_text(f"✅ 已设置入金费率为 {val*100:.0f}%")
+                await safe_send_message(bot, chat_id, f"✅ 已设置入金费率为 {val*100:.0f}%")
             elif "入金汇率" in text:
                 val = float(text.replace("设置入金汇率", "").strip())
                 db.update_group_config(chat_id, in_fx=val)
-                await update.message.reply_text(f"✅ 已设置入金汇率为 {val}")
+                await safe_send_message(bot, chat_id, f"✅ 已设置入金汇率为 {val}")
             elif "出金费率" in text:
                 val = float(text.replace("设置出金费率", "").strip()) / 100.0
                 db.update_group_config(chat_id, out_rate=val)
-                await update.message.reply_text(f"✅ 已设置出金费率为 {val*100:.0f}%")
+                await safe_send_message(bot, chat_id, f"✅ 已设置出金费率为 {val*100:.0f}%")
             elif "出金汇率" in text:
                 val = float(text.replace("设置出金汇率", "").strip())
                 db.update_group_config(chat_id, out_fx=val)
-                await update.message.reply_text(f"✅ 已设置出金汇率为 {val}")
+                await safe_send_message(bot, chat_id, f"✅ 已设置出金汇率为 {val}")
         except ValueError:
-            await update.message.reply_text("❌ 格式错误，请输入数字")
+            await safe_send_message(bot, chat_id, "❌ 格式错误，请输入数字")
         return
 
     # 入金（仅管理员，注意已经排除 +0）
@@ -672,7 +658,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rate = config.get("in_rate", 0)
         fx = config.get("in_fx", 0)
         if fx == 0:
-            await update.message.reply_text("⚠️ 请先设置费率和汇率")
+            await safe_send_message(bot, chat_id, "⚠️ 请先设置费率和汇率")
             return
         amt_f = float(amt)
         rate_f = float(rate)
@@ -710,13 +696,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amt, country = parse_amount_and_country(text)
         if amt is None or amt == 0:
             return
-        # 入金是 +，出金是 -，这里我们统一用绝对值计算
-        amt = abs(amt)
         config = db.get_group_config(chat_id)
         rate = config.get("out_rate", 0)
         fx = config.get("out_fx", 0)
         if fx == 0:
-            await update.message.reply_text("⚠️ 请先设置费率和汇率")
+            await safe_send_message(bot, chat_id, "⚠️ 请先设置费率和汇率")
             return
         amt_f = float(amt)
         rate_f = float(rate)
@@ -755,8 +739,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             usdt_str = text.replace("下发", "", 1).strip()
             usdt_val = float(usdt_str)
         except ValueError:
-            await update.message.reply_text(
-                "❌ 格式错误，请输入：下发35.04 或 下发-35.04"
+            await safe_send_message(
+                bot,
+                chat_id,
+                "❌ 格式错误，请输入：下发35.04 或 下发-35.04",
             )
             return
 
@@ -791,7 +777,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 更多记录
     if text in ("更多记录", "查看更多记录", "更多账单", "显示历史账单"):
-        await update.message.reply_text(render_full_summary(chat_id))
+        await safe_send_message(bot, chat_id, render_full_summary(chat_id))
         return
 
 
@@ -954,61 +940,34 @@ def api_rollback():
 
 # ========= Bot 事件循环线程 =========
 
-
 def run_bot_loop():
-    """
-    在独立线程中启动 Telegram Application（Webhook 模式）。
-    使用 HTTPXRequest，并把各种超时时间拉长一点，降低偶发超时的概率。
-    """
+    """在单独线程里启动 Telegram Application，并设置 Webhook"""
     global telegram_app, bot_loop
-
-    logger.info("🤖 初始化 Telegram Bot Application...")
-
-    request = HTTPXRequest(
-        connect_timeout=15.0,
-        read_timeout=20.0,
-        write_timeout=20.0,
-        pool_timeout=20.0,
-    )
 
     bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(bot_loop)
 
-    telegram_app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
+    telegram_app = application
 
-    async def async_init():
-        me = await telegram_app.bot.get_me()
-        logger.info(f"✅ Bot 已登录：@{me.username} (id={me.id})")
-
+    async def init_and_idle():
+        logger.info("🔗 设置 Webhook: %s/webhook/%s", WEBHOOK_URL, BOT_TOKEN)
         if WEBHOOK_URL:
-            webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
-            logger.info(f"🔗 设置 Webhook: {webhook_url}")
-            await telegram_app.bot.set_webhook(
-                url=webhook_url,
-                allowed_updates=["message"],
-            )
-            logger.info("✅ Webhook 已设置")
-
-        await telegram_app.initialize()
-        await telegram_app.start()
+            await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}")
+        await application.initialize()
+        await application.start()
         logger.info("✅ Telegram Bot 初始化完成")
+        # 简单 idle 循环，保持线程不退出
+        while True:
+            await asyncio.sleep(3600)
 
-    bot_loop.run_until_complete(async_init())
-    bot_loop.run_forever()
+    bot_loop.run_until_complete(init_and_idle())
 
 
 # ========= 应用初始化函数 =========
-
 
 def init_app():
     """初始化数据库、管理员、Webhook 等"""
@@ -1027,7 +986,10 @@ def init_app():
     # 1. 初始化数据库
     try:
         db.init_database()
-        db.cleanup_old_transactions(30)   # ✨ 只保留最近 30 天的数据
+        # ✅ 只保留最近 N 天的交易记录（目前是 30 天）
+        db.cleanup_old_transactions(30)
+        logger.info("✅ Database initialized successfully")
+        logger.info("🧹 已删除 30 天之前的交易记录，只保留最近 30 天的数据")
         logger.info("✅ 数据库初始化完成")
     except Exception as e:
         logger.exception("❌ 数据库初始化失败: %s", e)
