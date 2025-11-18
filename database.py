@@ -102,6 +102,19 @@ class FinanceDB:
             txs: List[Dict[str, Any]] = data.get("transactions", [])
             return [t for t in txs if t.get("date") == date_str]
 
+    def clear_day_transactions(self, user_id: int, date_str: str) -> int:
+        """
+        清除某一天（从当天 00:00 开始的所有）记录，返回删除条数
+        """
+        with self._lock:
+            data = self._load_user_data(user_id)
+            txs: List[Dict[str, Any]] = data.get("transactions", [])
+            remain = [t for t in txs if t.get("date") != date_str]
+            deleted = len(txs) - len(remain)
+            data["transactions"] = remain
+            self._save_user_data(user_id, data)
+            return deleted
+
     def get_day_summary(self, user_id: int, date_str: str) -> Dict[str, float]:
         """当天入账 / 出账汇总"""
         txs = self.get_day_transactions(user_id, date_str)
