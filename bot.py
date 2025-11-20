@@ -236,11 +236,32 @@ def resolve_params(chat_id: int, direction: str, country: str|None) -> dict:
     return d
 
 def parse_amount_and_country(text: str):
-    m = re.match(r"^[\+\-]\s*([0-9]+(?:\.[0-9]+)?)", text.strip())
-    if not m: return None, None
-    amount = float(m.group(1))
-    m2 = re.search(r"/\s*([^\s]+)$", text)
-    country = m2.group(1) if m2 else None
+    """
+    解析金额 & 国家，支持：
+      +10000
+      +10000 / 日本
+      +1千 / 日本   -> 1000
+      -2.5万       -> 25000
+    说明：返回金额始终为正数，正负由调用处的 + / - 决定
+    """
+    s = text.strip()
+    # 符号 数字 可选空格 + 单位(千/万/k/w) 可选 "/ 国家"
+    m = re.match(
+        r'^([+\-])\s*'                  # 符号
+        r'([0-9]+(?:\.[0-9]+)?)\s*'     # 数字
+        r'([千万kKwW]?)'                # 可选单位
+        r'(?:/\s*([^\s]+))?$',          # 可选 / 国家
+        s
+    )
+    if not m:
+        return None, None
+    sign, num_str, unit, country = m.groups()
+    amount = float(num_str)
+    if unit in ("千", "k", "K"):
+        amount *= 1000
+    elif unit in ("万", "w", "W"):
+        amount *= 10000
+    # 注意：这里不根据 sign 取负数，+ / - 逻辑由外层判断
     return amount, country
 
 # ========== 管理员系统 ==========
@@ -519,11 +540,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "⏳ 请耐心等待回复"
                     )
                     return
-                    
                 except Exception as e:
                     print(f"转发私聊消息失败: {e}")
             else:
-                # OWNER 私聊控制面板略——保留原逻辑（广播等）
                 if update.message.reply_to_message:
                     replied_msg_id = update.message.reply_to_message.message_id
                     if 'private_msg_map' in context.bot_data:
@@ -908,7 +927,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 入金（截断）
+    # 入金（截断）——已支持 +1千 / +2.5万
     if text.startswith("+"):
         if not is_admin(user.id):
             return
@@ -932,7 +951,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 出金（四舍五入）
+    # 出金（四舍五入）——已支持 -1千 / -2.5万
     if text.startswith("-"):
         if not is_admin(user.id):
             return
