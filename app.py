@@ -40,7 +40,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
 SESSION_SECRET = os.getenv("SESSION_SECRET")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://localhost:5000")
-# 轮询版不再使用 WEBHOOK_URL
+# 轮询版不再使用 WEBHOOK_URL（可保留环境变量但不会用到）
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN:
@@ -375,7 +375,7 @@ def to_superscript(num: int) -> str:
         "2": "²",
         "3": "³",
         "4": "⁴",
-        "5": "⁵",
+        "5": "⁶",
         "6": "⁶",
         "7": "⁷",
         "8": "⁸",
@@ -570,7 +570,7 @@ def render_full_summary(chat_id: int) -> str:
     config = get_group_config(chat_id)
     summary = get_transactions_summary(chat_id)
 
-    bot_name = config.get("group_name", "AA全球国际支付")
+    bot_name = config.get("group_name", "全球国际支付")
 
     in_recs = summary["in_records"]
     out_recs = summary["out_records"]
@@ -637,7 +637,7 @@ async def send_summary_with_button(update: Update, chat_id: int, user_id: int):
     if SESSION_SECRET:
         web_url = generate_web_url(chat_id, user_id)
         if web_url:
-            keyboard = [[InlineKeyboardButton("📊 查看账单明细", url=web_url)]]
+            keyboard = [[InlineKeyboardButton(" 查看账单明细", url=web_url)]]
             markup = InlineKeyboardMarkup(keyboard)
             msg = await update.message.reply_text(text, reply_markup=markup)
         else:
@@ -1009,203 +1009,4 @@ def index():
 
 
 @app.route("/health")
-def health():
-    return "OK", 200
-
-
-# **轮询版不需要 webhook 路由，这里删除 / 注释掉原有 /webhook/<token>**
-
-
-# ----- Dashboard -----
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    user_info = session["user_info"]
-    chat_id = user_info["chat_id"]
-    user_id = user_info["user_id"]
-
-    cfg = get_group_config(chat_id)
-    display = {
-        "deposit_fee_rate": float(cfg.get("in_rate", 0) or 0) * 100,
-        "deposit_fx": float(cfg.get("in_fx", 0) or 0),
-        "withdrawal_fee_rate": float(cfg.get("out_rate", 0) or 0) * 100,
-        "withdrawal_fx": float(cfg.get("out_fx", 0) or 0),
-    }
-
-    is_owner = False
-    if OWNER_ID and OWNER_ID.isdigit():
-        is_owner = user_id == int(OWNER_ID)
-
-    return render_template(
-        "dashboard.html",
-        chat_id=chat_id,
-        user_id=user_id,
-        is_owner=is_owner,
-        config=display,
-    )
-
-
-@app.route("/api/transactions")
-@login_required
-def api_transactions():
-    user_info = session["user_info"]
-    chat_id = user_info["chat_id"]
-
-    txns = get_today_transactions(chat_id)
-    records = []
-    for t in txns:
-        rtype = {
-            "in": "deposit",
-            "out": "withdrawal",
-            "send": "disbursement",
-        }.get(t["transaction_type"], "unknown")
-
-        created_raw = t.get("created_at")
-        ts_val = 0
-        if isinstance(created_raw, str):
-            try:
-                ts_val = datetime.fromisoformat(created_raw).timestamp()
-            except Exception:
-                ts_val = 0
-
-        records.append(
-            {
-                "time": t["timestamp"],
-                "type": rtype,
-                "amount": float(t["amount"]),
-                "fee_rate": float(t["rate"]) * 100,
-                "exchange_rate": float(t["fx"]),
-                "usdt": float(t["usdt"]),
-                "operator": t.get("operator_name", "未知"),
-                "message_id": t.get("message_id"),
-                "timestamp": ts_val,
-            }
-        )
-
-    stats = {
-        "total_deposit": sum(r["amount"] for r in records if r["type"] == "deposit"),
-        "total_deposit_usdt": sum(r["usdt"] for r in records if r["type"] == "deposit"),
-        "total_withdrawal": sum(
-            r["amount"] for r in records if r["type"] == "withdrawal"
-        ),
-        "total_withdrawal_usdt": sum(
-            r["usdt"] for r in records if r["type"] == "withdrawal"
-        ),
-        "total_disbursement": sum(
-            r["usdt"] for r in records if r["type"] == "disbursement"
-        ),
-        "pending_disbursement": 0,
-        "by_operator": {},
-    }
-
-    stats["pending_disbursement"] = (
-        stats["total_deposit_usdt"]
-        - stats["total_withdrawal_usdt"]
-        - stats["total_disbursement"]
-    )
-
-    for r in records:
-        op = r["operator"]
-        if op not in stats["by_operator"]:
-            stats["by_operator"][op] = {
-                "deposit_count": 0,
-                "deposit_usdt": 0,
-                "withdrawal_count": 0,
-                "withdrawal_usdt": 0,
-                "disbursement_count": 0,
-                "disbursement_usdt": 0,
-            }
-        bucket = stats["by_operator"][op]
-        if r["type"] == "deposit":
-            bucket["deposit_count"] += 1
-            bucket["deposit_usdt"] += r["usdt"]
-        elif r["type"] == "withdrawal":
-            bucket["withdrawal_count"] += 1
-            bucket["withdrawal_usdt"] += r["usdt"]
-        elif r["type"] == "disbursement":
-            bucket["disbursement_count"] += 1
-            bucket["disbursement_usdt"] += r["usdt"]
-
-    return jsonify({"success": True, "records": records, "statistics": stats})
-
-
-@app.route("/api/rollback", methods=["POST"])
-@login_required
-def api_rollback():
-    user_info = session["user_info"]
-    user_id = user_info["user_id"]
-
-    is_owner = False
-    if OWNER_ID and OWNER_ID.isdigit():
-        is_owner = user_id == int(OWNER_ID)
-    if not is_owner:
-        return jsonify({"success": False, "error": "无权限"}), 403
-
-    data = request.json or {}
-    msg_id = data.get("message_id")
-    if not msg_id:
-        return jsonify({"success": False, "error": "参数错误"}), 400
-
-    deleted = delete_transaction_by_message_id(msg_id)
-    if deleted:
-        return jsonify({"success": True, "message": "交易已回退"})
-    return jsonify({"success": False, "error": "未找到交易"}), 404
-
-# ========== Bot 初始化 & 事件循环（轮询） ==========
-
-async def setup_telegram_bot_polling():
-    """
-    初始化 Telegram Bot，并使用 long polling 接收消息。
-    不需要任何公网 HTTPS / Webhook。
-    """
-    global telegram_app
-
-    logger.info("🤖 初始化 Telegram Bot Application (JSON DB, polling 模式)...")
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(
-        MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_text)
-    )
-
-    logger.info("🔄 Bot 开始轮询接收消息 (run_polling)...")
-    await telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
-    logger.info("🛑 Bot 轮询结束")
-
-
-def run_bot_loop():
-    """
-    在单独线程中启动 asyncio 事件循环，运行轮询。
-    """
-    asyncio.run(setup_telegram_bot_polling())
-
-# ========== 应用初始化 ==========
-
-def init_app():
-    logger.info("=" * 50)
-    logger.info("🚀 启动 Telegram Bot + Web Dashboard (JSON DB / polling)")
-    logger.info("=" * 50)
-
-    init_database()
-    logger.info("✅ JSON 数据库初始化完成")
-
-    if OWNER_ID and OWNER_ID.isdigit():
-        add_admin(int(OWNER_ID), None, "Owner", is_owner=True)
-        logger.info(f"✅ OWNER 已设置为管理员: {OWNER_ID}")
-
-    logger.info("✅ 应用初始化完成")
-    logger.info("=" * 50)
-
-# ========== 主入口 ==========
-
-if __name__ == "__main__":
-    init_app()
-
-    logger.info("🔄 启动 Bot 轮询线程...")
-    t = threading.Thread(target=run_bot_loop, daemon=True)
-    t.start()
-
-    port = int(os.getenv("PORT", "5000"))
-    logger.info(f"🌐 Flask 应用启动在端口: {port}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+def heal
