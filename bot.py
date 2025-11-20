@@ -38,7 +38,6 @@ def get_default_state():
         "last_date": ""
     }
 
-
 def group_file_path(chat_id: int) -> Path:
     """获取群组状态文件路径"""
     return GROUPS_DIR / f"group_{chat_id}.json"
@@ -141,7 +140,6 @@ def remove_admin(user_id: int) -> bool:
         return True
     return False
 
-
 # ========== 工具函数 ==========
 def trunc2(x: float) -> float:
     """截断到两位小数（入金 & 汇总用）"""
@@ -149,7 +147,7 @@ def trunc2(x: float) -> float:
     return math.floor(rounded * 100.0) / 100.0
 
 def round2(x: float) -> float:
-    """四舍五入到两位小数（出金显示/计算用）"""
+    """四舍五入到两位小数（出金显示用）"""
     return round(float(x), 2)
 
 def fmt_usdt(x: float) -> str:
@@ -237,33 +235,26 @@ def resolve_params(chat_id: int, direction: str, country: str|None) -> dict:
 
 def parse_amount_and_country(text: str):
     """
-    解析金额 + 国家
-    - 支持：+10000 / 日本
-    - 支持：-200 /US
-    - 新增：+1千 / 日本  -> 1000
-           +1万        -> 10000
+    支持：
+      +100
+      +1千 / +1万 / +1.5万
+      +1000 / 日本
+      +1万 / 日本
     """
     s = text.strip()
-    m = re.match(r"^([+\-])\s*([0-9]+(?:\.[0-9]+)?)(.*)$", s)
+    # 先拿金额 + 单位（千/万/k/w）
+    m = re.match(r"^[\+\-]\s*([0-9]+(?:\.[0-9]+)?)\s*([万千kKwW]?)", s)
     if not m:
         return None, None
-    sign = m.group(1)
-    num_str = m.group(2)
-    tail = m.group(3).strip()
+    amount = float(m.group(1))
+    unit = m.group(2)
 
-    amount = float(num_str)
-
-    # 中文单位转换
-    # 只要后面带“万”，认为是 * 10000；带“千”认为 *1000
-    if "万" in tail:
-        amount *= 10000
-    elif "千" in tail:
+    if unit in ("千", "k", "K"):
         amount *= 1000
+    elif unit in ("万", "w", "W"):
+        amount *= 10000
 
-    # 金额对调用方始终返回正数（入金/出金方向通过+/-判断）
-    amount = abs(amount)
-
-    # 提取国家（/ 日本）
+    # 再解析 / 国家
     m2 = re.search(r"/\s*([^\s]+)$", s)
     country = m2.group(1) if m2 else None
     return amount, country
@@ -274,7 +265,6 @@ def is_admin(user_id: int) -> bool:
         return True
     admin_list = load_admins()
     return user_id in admin_list
-
 
 def list_admins():
     """获取管理员列表"""
@@ -311,7 +301,7 @@ def render_group_summary(chat_id: int) -> str:
     
     lines.append("")
     
-    # 出金记录（使用四舍五入）
+    # 出金记录（四舍五入）
     lines.append(f"已出账 ({len(normal_out)}笔)")
     if normal_out:
         for r in normal_out[:5]:
@@ -431,8 +421,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "🤖 你好，我是财务记账机器人。\n\n"
                 "📊 记账操作：\n"
-                "  入金：+10000 / 日本、+1千、+1万\n"
-                "  出金：-10000 / 日本、-1千、-1万\n"
+                "  入金：+10000 或 +10000 / 日本\n"
+                "  出金：-10000 或 -10000 / 日本\n"
+                "  支持：+1千 / +1万 / +1.5万 等简写\n"
                 "  查看账单：+0 或 更多记录\n\n"
                 "💰 USDT下发（仅管理员）：\n"
                 "  下发35.04（记录下发并扣除应下发）\n"
@@ -442,7 +433,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  撤销出金（撤销最近一笔出金）\n"
                 "  撤销下发（撤销最近一笔下发/撤销下发）\n\n"
                 "🧹 清空数据（仅管理员）：\n"
-                "  清除数据 / 清空数据 / 清空账单（清空今日所有记录）\n\n"
+                "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
                 "⚙️ 快速设置（仅管理员）：\n"
                 "  重置默认值（一键设置推荐费率/汇率）\n"
                 "  设置入金费率 10\n"
@@ -472,8 +463,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 你好，我是财务记账机器人。\n\n"
             "📊 记账操作：\n"
-            "  入金：+10000 或 +10000 / 日本，也支持 +1千、+1万\n"
-            "  出金：-10000 或 -10000 / 日本，也支持 -1千、-1万\n"
+            "  入金：+10000 或 +10000 / 日本（支持 +1千 / +1万）\n"
+            "  出金：-10000 或 -10000 / 日本（结果四舍五入）\n"
             "  查看账单：+0 或 更多记录\n\n"
             "💰 USDT下发（仅管理员）：\n"
             "  下发35.04（记录下发并扣除应下发）\n"
@@ -481,7 +472,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔄 撤销功能（仅管理员）：\n"
             "  撤销入金 / 撤销出金 / 撤销下发\n\n"
             "🧹 清空数据（仅管理员）：\n"
-            "  清除数据 / 清空数据 / 清空账单\n\n"
+            "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
             "⚙️ 快速设置（仅管理员）：\n"
             "  重置默认值\n"
             "  设置入金费率 10\n"
@@ -548,7 +539,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"转发私聊消息失败: {e}")
             else:
-                # OWNER 私聊控制面板（广播等）
+                # OWNER 逻辑（回复 / 广播）
                 if update.message.reply_to_message:
                     replied_msg_id = update.message.reply_to_message.message_id
                     if 'private_msg_map' in context.bot_data:
@@ -750,7 +741,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         state["defaults"] = {
             "in":  {"rate": 0.10, "fx": 153},
-            "out": {"rate": 0.02, "fx": 137},  # 出金费率用正 0.02，公式里 (1 + rate)
+            "out": {"rate": 0.02, "fx": 137},  # 正值，公式用 (1 + rate)
         }
         save_group_state(chat_id)
         
@@ -832,8 +823,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ 数值格式错误")
             return
 
-    # 🧹 清除 / 清空 数据（今天）
-    if text in ("清除数据", "清空数据", "清空账单"):
+    # 🧹 清除 / 清空 数据（今天）—— 支持多个说法
+    if text in ("清除数据", "清空数据", "清楚数据", "清除账单", "清空账单"):
         if not is_admin(user.id):
             return
         in_count = len(state["recent"]["in"])
