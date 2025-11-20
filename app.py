@@ -1009,4 +1009,6 @@ def index():
 
 
 @app.route("/health")
-def heal
+def health():
+    return "OK", 200
+
