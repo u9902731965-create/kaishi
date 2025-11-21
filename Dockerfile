@@ -7,7 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
-# 创建数据目录（可选，但建议保留）
 RUN mkdir -p /app/data/groups /app/data/logs/private_chats
 
 EXPOSE 10000
