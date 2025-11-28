@@ -372,7 +372,8 @@ def render_group_summary(chat_id: int) -> str:
     lines.append(f"固定汇率：入 {fin} ⇄ 出 {fout}")
     lines.append(f"应下发：{fmt_usdt(should)}")
     lines.append(f"已下发：{fmt_usdt(sent)}")
-    lines.append(f"{if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
+    # 关键修复：使用三元表达式生成图标
+    lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("**查看更多记录**：发送「更多记录」")
     return "\n".join(lines)
@@ -626,9 +627,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 return
 
                 if text.startswith("广播 ") or text.startswith("群发 "):
-                    broadcast_text = (
-                        text.split(" ", 1)[1] if len(text.split(" ", 1)) > 1 else ""
-                    )
+                    parts = text.split(" ", 1)
+                    broadcast_text = parts[1] if len(parts) > 1 else ""
                     if not broadcast_text:
                         await update.message.reply_text(
                             "❌ 请输入广播内容，例如：广播 今天有新活动"
