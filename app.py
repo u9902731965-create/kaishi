@@ -368,13 +368,13 @@ def render_group_summary(chat_id: int) -> str:
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"⚙️ 当前费率：入 {rin * 100:.0f}% ⇄ 出 {abs(rout) * 100:.0f}%")
-    lines.append(f"💱 固定汇率：入 {fin} ⇄ 出 {fout}")
-    lines.append(f"📊 应下发：{fmt_usdt(should)}")
-    lines.append(f"📤 已下发：{fmt_usdt(sent)}")
-    lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
+    lines.append(f"当前费率：入 {rin * 100:.0f}% ⇄ 出 {abs(rout) * 100:.0f}%")
+    lines.append(f"固定汇率：入 {fin} ⇄ 出 {fout}")
+    lines.append(f"应下发：{fmt_usdt(should)}")
+    lines.append(f"已下发：{fmt_usdt(sent)}")
+    lines.append(f"{if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
     lines.append("━━━━━━━━━━━━━━")
-    lines.append("📚 **查看更多记录**：发送「更多记录」")
+    lines.append("**查看更多记录**：发送「更多记录」")
     return "\n".join(lines)
 
 
