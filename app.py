@@ -106,7 +106,7 @@ admins_cache: list[int] | None = None
 
 
 def load_admins() -> list[int]:
-    """从JSON文件加载管理员列表"""
+    """从JSON文件加载管理员列表（机器人层面的全局管理员）"""
     global admins_cache
     if admins_cache is not None:
         return admins_cache
@@ -140,7 +140,7 @@ def save_admins(admin_list: list[int]):
 
 
 def add_admin(user_id: int) -> bool:
-    """添加管理员"""
+    """添加机器人管理员"""
     admins = load_admins()
     if user_id not in admins:
         admins.append(user_id)
@@ -150,7 +150,7 @@ def add_admin(user_id: int) -> bool:
 
 
 def remove_admin(user_id: int) -> bool:
-    """移除管理员"""
+    """移除机器人管理员"""
     admins = load_admins()
     if user_id in admins:
         admins.remove(user_id)
@@ -300,6 +300,7 @@ def parse_amount_and_country(text: str):
 
 # ========== 管理员系统 ==========
 def is_admin(user_id: int) -> bool:
+    """机器人全局管理员（包括 OWNER_ID）"""
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
     admin_list = load_admins()
@@ -307,7 +308,7 @@ def is_admin(user_id: int) -> bool:
 
 
 def list_admins() -> list[int]:
-    """获取管理员列表"""
+    """获取机器人管理员列表"""
     return load_admins()
 
 
@@ -372,7 +373,6 @@ def render_group_summary(chat_id: int) -> str:
     lines.append(f"固定汇率：入 {fin} ⇄ 出 {fout}")
     lines.append(f"应下发：{fmt_usdt(should)}")
     lines.append(f"已下发：{fmt_usdt(sent)}")
-    # 关键修复：使用三元表达式生成图标
     lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("**查看更多记录**：发送「更多记录」")
@@ -458,7 +458,7 @@ from telegram.ext import (
 async def is_group_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> bool:
-    """检查用户是否是群组管理员或群主"""
+    """检查用户是否是群组管理员或群主（Telegram 层面的）"""
     chat = update.effective_chat
     if chat.type == "private":
         return False
@@ -467,6 +467,19 @@ async def is_group_admin(
         return member.status in ["creator", "administrator"]
     except Exception:
         return False
+
+
+async def has_group_manage_permission(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> bool:
+    """
+    群内管理权限判断：
+    - 机器人全局管理员（is_admin）✅
+    - 或 群主 / 群管理员（is_group_admin）✅
+    """
+    if is_admin(user_id):
+        return True
+    return await is_group_admin(update, context, user_id)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -514,7 +527,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📌 如何成为机器人管理员（详细步骤）：\n\n"
                 "第1步：添加机器人到群组\n"
                 "第2步：在群里发一条消息\n"
-                "第3步：让现有管理员回复你的消息并发送「设置管理员」\n"
+                "第3步：让群主或现有管理员回复你的消息并发送「设置管理员」\n"
                 "第4步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
             )
     else:
@@ -683,12 +696,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_and_reset_daily(chat_id)
     state = load_group_state(chat_id)
 
+    # 🏷️ 设置账单名称（自定义汇总标题）
+    # 用法：设置账单名称 东起
+    if text.startswith("设置账单名称"):
+        if not await has_group_manage_permission(update, context, user.id):
+            return
+
+        new_name = text.replace("设置账单名称", "", 1).strip()
+        if not new_name:
+            await update.message.reply_text("❌ 请输入账单名称，例如：设置账单名称 东起")
+            return
+
+        state["bot_name"] = new_name
+        save_group_state(chat_id)
+        await update.message.reply_text(
+            f"✅ 账单名称已修改为：{new_name}\n以后汇总将显示为：【{new_name} 账单汇总】"
+        )
+        return
+
     # 查看账单
     if text == "+0":
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 管理员管理命令
+    # 管理员管理命令（群主 / 群管理员 / 机器人管理员 都可以设置）
     if text.startswith(("设置管理员", "删除管理员", "显示管理员")):
         lst = list_admins()
         if text.startswith("显示"):
@@ -719,7 +750,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines))
             return
 
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             await update.message.reply_text("🚫 你没有权限设置机器人管理员。")
             return
 
@@ -757,7 +788,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 查询国家点位
     if text.endswith("当前点位"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
 
         country = text.replace("当前点位", "").strip()
@@ -814,7 +845,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 重置默认值
     if text in ("重置默认值", "恢复默认值"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
 
         state["defaults"] = {
@@ -832,7 +863,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 简单设置入金/出金默认费率/汇率
     if text.startswith(("设置入金费率", "设置入金汇率", "设置出金费率", "设置出金汇率")):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         try:
             direction = ""
@@ -871,7 +902,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 高级设置命令（指定国家）
     if text.startswith("设置") and not text.startswith(("设置入金", "设置出金")):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
 
         pattern = r"^设置\s*(.+?)(入|出)(费率|汇率)\s*(\d+(?:\.\d+)?)\s*$"
@@ -905,7 +936,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🧹 清除 / 清空 数据（今天）—— 支持多个说法
     if text in ("清除数据", "清空数据", "清楚数据", "清除账单", "清空账单"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         in_count = len(state["recent"]["in"])
         out_count = len(state["recent"]["out"])
@@ -931,7 +962,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔄 撤销入金（撤销最近一笔入金）
     if text == "撤销入金":
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         rec_in = state["recent"]["in"]
         if not rec_in:
@@ -955,7 +986,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔄 撤销出金（撤销最近一笔普通出金）
     if text == "撤销出金":
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         rec_out = state["recent"]["out"]
         # 找到最近一笔 type != '下发' 的记录
@@ -985,7 +1016,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔄 撤销下发（撤销最近一笔“下发 / 撤销下发”）
     if text == "撤销下发":
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         rec_out = state["recent"]["out"]
         target_idx = None
@@ -1018,7 +1049,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 入金（截断）
     if text.startswith("+"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         amt, country = parse_amount_and_country(text)
         if amt is None:
@@ -1054,7 +1085,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 出金（四舍五入）
     if text.startswith("-"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         amt, country = parse_amount_and_country(text)
         if amt is None:
@@ -1090,7 +1121,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 下发USDT（截断）
     if text.startswith("下发"):
-        if not is_admin(user.id):
+        if not await has_group_manage_permission(update, context, user.id):
             return
         try:
             usdt_str = text.replace("下发", "").strip()
@@ -1164,7 +1195,7 @@ def init_bot():
 
     print("✅ Bot Token 已加载")
     print(f"📊 数据目录: {DATA_DIR}")
-    print(f"👑 超级管理员: {OWNER_ID or '未设置'}")
+    print(f"👑 超级管理员(OWNER_ID): {OWNER_ID or '未设置'}")
 
     port = int(os.getenv("PORT", "10000"))
     print(f"\n🌐 启动HTTP健康检查服务器（端口 {port}）...")
