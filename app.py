@@ -14,7 +14,7 @@ import requests  # 当前没有用到，用于以后需要时保留
 # ========== 加载环境 ==========
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")  # 可选：你的 Telegram ID（字符串），拥有永久管理员权限
+OWNER_ID = os.getenv("OWNER_ID")  # 可选：你的 Telegram ID（字符串），拥有超级管理员权限
 
 # ========== 记账核心状态（多群组支持）==========
 DATA_DIR = Path("./data")
@@ -74,7 +74,7 @@ def load_group_state(chat_id: int) -> dict:
                 },
             )
             state.setdefault("countries", {})
-            state.setdefault("bot_name", "全球国际支付")
+            state.setdefault("bot_name", "东起国际账单")
             state.setdefault("last_date", "")
             groups_state[chat_id] = state
             return state
@@ -302,7 +302,7 @@ def parse_amount_and_country(text: str):
 def is_bot_admin(user_id: int) -> bool:
     """
     机器人管理员 / 超级管理员：
-    - 可以操作所有记账功能
+    - 可以操作所有记账功能（入金/出金/下发/撤销/清空/改费率等）
     """
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
@@ -315,10 +315,11 @@ async def can_manage_bot_admin(
 ) -> bool:
     """
     能否设置/删除机器人管理员：
-    - 超级管理员 ✅
-    - 群主 / 群管理员 ✅
-    - 机器人管理员 ❌（除非同时是群管或群主）
+    - 超级管理员(OWNER_ID) ✅
+    - 群主(creator) ✅
+    - 其它任何人（包括群管理员 administrator）❌
     """
+    # 超级管理员永远有权限
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
 
@@ -328,7 +329,8 @@ async def can_manage_bot_admin(
 
     try:
         member = await context.bot.get_chat_member(chat.id, user_id)
-        return member.status in ("creator", "administrator")
+        # 只允许群主操作，不再允许普通管理员
+        return member.status == "creator"
     except Exception:
         return False
 
@@ -456,7 +458,7 @@ def render_full_summary(chat_id: int) -> str:
     if send_out:
         lines.append(f"已下发 ({len(send_out)}笔)")
         for r in send_out:
-            usdt = trunc2(abs(r["usdt"]))
+            usdt = trunc2(abs(r["usdt"])))
             lines.append(f"{r['ts']} {usdt}")
         lines.append("")
 
@@ -484,7 +486,7 @@ from telegram.ext import (
 async def is_group_owner_or_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> bool:
-    """检查用户是否是群主或群管理员（Telegram 层面的）"""
+    """检查用户是否是群主或群管理员（Telegram 层面的）—— 当前未用于权限，只作工具保留"""
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return False
@@ -525,7 +527,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔧 国家专属设置：\n"
                 "  设置 日本 入 费率 8\n"
                 "  设置 日本 入 汇率 127\n\n"
-                "👥 管理机器人管理员（仅群主 / 群管理员 / 超级管理员）：\n"
+                "👥 管理机器人管理员（仅群主 / 超级管理员）：\n"
                 "  设置管理员（回复消息）\n"
                 "  删除管理员（回复消息）\n"
                 "  显示管理员"
@@ -536,8 +538,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💬 发送 /start 查看说明\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "📌 如何成为机器人管理员：\n\n"
-                "第1步：在群里找到群主或群管理员\n"
-                "第2步：让他们回复你的消息并发送「设置管理员」\n"
+                "第1步：联系群主\n"
+                "第2步：让群主在群里回复你的消息并发送「设置管理员」\n"
                 "第3步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
             )
     else:
@@ -546,7 +548,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
             "  入金：+10000 或 +10000 / 日本（支持 +1千 / +1万）\n"
             "  出金：-10000 或 -10000 / 日本（结果四舍五入）\n"
-            "  查看账单：+0 或 更多记录\n\n"
+            "  查看账单：+0 或 更多记录（所有人可用）\n\n"
             "💰 USDT下发（仅机器人管理员 / 超级管理员）：\n"
             "  下发35.04（记录下发并扣除应下发）\n"
             "  下发-35.04（撤销下发并增加应下发）\n\n"
@@ -560,7 +562,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  设置入金汇率 153\n"
             "  设置出金费率 2\n"
             "  设置出金汇率 137\n\n"
-            "👥 管理机器人管理员（仅群主 / 群管理员 / 超级管理员）：\n"
+            "👥 管理机器人管理员（仅群主 / 超级管理员）：\n"
             "  设置管理员（回复消息）\n"
             "  删除管理员（回复消息）\n"
             "  显示管理员"
@@ -759,9 +761,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines))
             return
 
-        # 设置 / 删除 管理员 —— 仅 群主 / 群管理员 / 超级管理员
+        # 设置 / 删除 管理员 —— 仅 群主 / 超级管理员
         if not await can_manage_bot_admin(update, context, user.id):
-            await update.message.reply_text("🚫 只有群主或群管理员可以设置机器人管理员。")
+            await update.message.reply_text("🚫 只有群主或超级管理员可以设置机器人管理员。")
             return
 
         target = None
