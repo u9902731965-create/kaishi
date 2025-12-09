@@ -39,7 +39,7 @@ def get_default_state() -> dict:
         },
         "countries": {},
         "precision": {"mode": "truncate", "digits": 2},
-        "bot_name": "全球国际支付",
+        "bot_name": "东起国际账单",
         "recent": {"in": [], "out": []},  # out 里同时存 普通出金 + 下发
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},
         "last_date": "",
@@ -106,7 +106,7 @@ admins_cache: list[int] | None = None
 
 
 def load_admins() -> list[int]:
-    """从JSON文件加载管理员列表（机器人层面的全局管理员）"""
+    """从JSON文件加载机器人管理员列表"""
     global admins_cache
     if admins_cache is not None:
         return admins_cache
@@ -129,7 +129,7 @@ def load_admins() -> list[int]:
 
 
 def save_admins(admin_list: list[int]):
-    """保存管理员列表到JSON文件"""
+    """保存机器人管理员列表到JSON文件"""
     global admins_cache
     admins_cache = admin_list
     try:
@@ -298,13 +298,39 @@ def parse_amount_and_country(text: str):
     return amount, country
 
 
-# ========== 管理员系统 ==========
-def is_admin(user_id: int) -> bool:
-    """机器人全局管理员（包括 OWNER_ID）"""
+# ========== 权限系统 ==========
+def is_bot_admin(user_id: int) -> bool:
+    """
+    机器人管理员 / 超级管理员：
+    - 可以操作所有记账功能
+    """
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
     admin_list = load_admins()
     return user_id in admin_list
+
+
+async def can_manage_bot_admin(
+    update, context, user_id: int
+) -> bool:
+    """
+    能否设置/删除机器人管理员：
+    - 超级管理员 ✅
+    - 群主 / 群管理员 ✅
+    - 机器人管理员 ❌（除非同时是群管或群主）
+    """
+    if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
+        return True
+
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user_id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        return False
 
 
 def list_admins() -> list[int]:
@@ -455,31 +481,18 @@ from telegram.ext import (
 )
 
 
-async def is_group_admin(
+async def is_group_owner_or_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> bool:
-    """检查用户是否是群组管理员或群主（Telegram 层面的）"""
+    """检查用户是否是群主或群管理员（Telegram 层面的）"""
     chat = update.effective_chat
-    if chat.type == "private":
+    if chat.type not in ("group", "supergroup"):
         return False
     try:
         member = await context.bot.get_chat_member(chat.id, user_id)
-        return member.status in ["creator", "administrator"]
+        return member.status in ("creator", "administrator")
     except Exception:
         return False
-
-
-async def has_group_manage_permission(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> bool:
-    """
-    群内管理权限判断：
-    - 机器人全局管理员（is_admin）✅
-    - 或 群主 / 群管理员（is_group_admin）✅
-    """
-    if is_admin(user_id):
-        return True
-    return await is_group_admin(update, context, user_id)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,33 +501,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 私聊模式
     if chat.type == "private":
-        if is_admin(user.id):
+        if is_bot_admin(user.id):
             await update.message.reply_text(
                 "🤖 你好，我是财务记账机器人。\n\n"
-                "📊 记账操作：\n"
+                "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
                 "  入金：+10000 或 +10000 / 日本\n"
                 "  出金：-10000 或 -10000 / 日本\n"
                 "  支持：+1千 / +1万 / +1.5万 等简写\n"
                 "  查看账单：+0 或 更多记录\n\n"
-                "💰 USDT下发（仅管理员）：\n"
+                "💰 USDT下发：\n"
                 "  下发35.04（记录下发并扣除应下发）\n"
                 "  下发-35.04（撤销下发并增加应下发）\n\n"
-                "🔄 撤销功能（仅管理员）：\n"
-                "  撤销入金（撤销最近一笔入金）\n"
-                "  撤销出金（撤销最近一笔出金）\n"
-                "  撤销下发（撤销最近一笔下发/撤销下发）\n\n"
-                "🧹 清空数据（仅管理员）：\n"
+                "🔄 撤销功能：\n"
+                "  撤销入金 / 撤销出金 / 撤销下发\n\n"
+                "🧹 清空数据：\n"
                 "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
-                "⚙️ 快速设置（仅管理员）：\n"
-                "  重置默认值（一键设置推荐费率/汇率）\n"
+                "⚙️ 快速设置：\n"
+                "  重置默认值\n"
                 "  设置入金费率 10\n"
                 "  设置入金汇率 153\n"
                 "  设置出金费率 2\n"
                 "  设置出金汇率 137\n\n"
-                "🔧 高级设置（指定国家）：\n"
+                "🔧 国家专属设置：\n"
                 "  设置 日本 入 费率 8\n"
                 "  设置 日本 入 汇率 127\n\n"
-                "👥 管理员管理：\n"
+                "👥 管理机器人管理员（仅群主 / 群管理员 / 超级管理员）：\n"
                 "  设置管理员（回复消息）\n"
                 "  删除管理员（回复消息）\n"
                 "  显示管理员"
@@ -522,35 +533,34 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "👋 你好！欢迎使用财务记账机器人\n\n"
-                "💬 发送 /start 查看完整操作说明\n"
+                "💬 发送 /start 查看说明\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "📌 如何成为机器人管理员（详细步骤）：\n\n"
-                "第1步：添加机器人到群组\n"
-                "第2步：在群里发一条消息\n"
-                "第3步：让群主或现有管理员回复你的消息并发送「设置管理员」\n"
-                "第4步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
+                "📌 如何成为机器人管理员：\n\n"
+                "第1步：在群里找到群主或群管理员\n"
+                "第2步：让他们回复你的消息并发送「设置管理员」\n"
+                "第3步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
             )
     else:
         await update.message.reply_text(
             "🤖 你好，我是财务记账机器人。\n\n"
-            "📊 记账操作：\n"
+            "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
             "  入金：+10000 或 +10000 / 日本（支持 +1千 / +1万）\n"
             "  出金：-10000 或 -10000 / 日本（结果四舍五入）\n"
             "  查看账单：+0 或 更多记录\n\n"
-            "💰 USDT下发（仅管理员）：\n"
+            "💰 USDT下发（仅机器人管理员 / 超级管理员）：\n"
             "  下发35.04（记录下发并扣除应下发）\n"
             "  下发-35.04（撤销下发并增加应下发）\n\n"
-            "🔄 撤销功能（仅管理员）：\n"
+            "🔄 撤销功能（仅机器人管理员 / 超级管理员）：\n"
             "  撤销入金 / 撤销出金 / 撤销下发\n\n"
-            "🧹 清空数据（仅管理员）：\n"
+            "🧹 清空数据（仅机器人管理员 / 超级管理员）：\n"
             "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
-            "⚙️ 快速设置（仅管理员）：\n"
+            "⚙️ 快速设置（仅机器人管理员 / 超级管理员）：\n"
             "  重置默认值\n"
             "  设置入金费率 10\n"
             "  设置入金汇率 153\n"
             "  设置出金费率 2\n"
             "  设置出金汇率 137\n\n"
-            "👥 管理员管理：\n"
+            "👥 管理机器人管理员（仅群主 / 群管理员 / 超级管理员）：\n"
             "  设置管理员（回复消息）\n"
             "  删除管理员（回复消息）\n"
             "  显示管理员"
@@ -696,10 +706,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_and_reset_daily(chat_id)
     state = load_group_state(chat_id)
 
-    # 🏷️ 设置账单名称（自定义汇总标题）
-    # 用法：设置账单名称 东起
+    # 🏷️ 设置账单名称（仅机器人管理员 / 超级管理员）
     if text.startswith("设置账单名称"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
 
         new_name = text.replace("设置账单名称", "", 1).strip()
@@ -714,12 +723,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 查看账单
+    # 查看账单（所有人可看）
     if text == "+0":
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 管理员管理命令（群主 / 群管理员 / 机器人管理员 都可以设置）
+    # 管理机器人管理员命令
     if text.startswith(("设置管理员", "删除管理员", "显示管理员")):
         lst = list_admins()
         if text.startswith("显示"):
@@ -750,8 +759,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines))
             return
 
-        if not await has_group_manage_permission(update, context, user.id):
-            await update.message.reply_text("🚫 你没有权限设置机器人管理员。")
+        # 设置 / 删除 管理员 —— 仅 群主 / 群管理员 / 超级管理员
+        if not await can_manage_bot_admin(update, context, user.id):
+            await update.message.reply_text("🚫 只有群主或群管理员可以设置机器人管理员。")
             return
 
         target = None
@@ -786,9 +796,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # 查询国家点位
+    # 查询国家点位（仅机器人管理员 / 超级管理员）
     if text.endswith("当前点位"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
 
         country = text.replace("当前点位", "").strip()
@@ -843,9 +853,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
         return
 
-    # 重置默认值
+    # 重置默认值（仅机器人管理员 / 超级管理员）
     if text in ("重置默认值", "恢复默认值"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
 
         state["defaults"] = {
@@ -861,9 +871,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 简单设置入金/出金默认费率/汇率
+    # 简单设置入金/出金默认费率/汇率（仅机器人管理员 / 超级管理员）
     if text.startswith(("设置入金费率", "设置入金汇率", "设置出金费率", "设置出金汇率")):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         try:
             direction = ""
@@ -900,9 +910,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ 格式错误，请输入有效的数字\n例如：设置入金费率 10")
         return
 
-    # 高级设置命令（指定国家）
+    # 高级设置命令（指定国家）（仅机器人管理员 / 超级管理员）
     if text.startswith("设置") and not text.startswith(("设置入金", "设置出金")):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
 
         pattern = r"^设置\s*(.+?)(入|出)(费率|汇率)\s*(\d+(?:\.\d+)?)\s*$"
@@ -934,9 +944,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ 数值格式错误")
             return
 
-    # 🧹 清除 / 清空 数据（今天）—— 支持多个说法
+    # 🧹 清除 / 清空 数据（今天）（仅机器人管理员 / 超级管理员）
     if text in ("清除数据", "清空数据", "清楚数据", "清除账单", "清空账单"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         in_count = len(state["recent"]["in"])
         out_count = len(state["recent"]["out"])
@@ -960,9 +970,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 🔄 撤销入金（撤销最近一笔入金）
+    # 🔄 撤销入金（仅机器人管理员 / 超级管理员）
     if text == "撤销入金":
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         rec_in = state["recent"]["in"]
         if not rec_in:
@@ -984,9 +994,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 🔄 撤销出金（撤销最近一笔普通出金）
+    # 🔄 撤销出金（仅机器人管理员 / 超级管理员）
     if text == "撤销出金":
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         rec_out = state["recent"]["out"]
         # 找到最近一笔 type != '下发' 的记录
@@ -1014,9 +1024,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 🔄 撤销下发（撤销最近一笔“下发 / 撤销下发”）
+    # 🔄 撤销下发（仅机器人管理员 / 超级管理员）
     if text == "撤销下发":
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         rec_out = state["recent"]["out"]
         target_idx = None
@@ -1047,9 +1057,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 入金（截断）
+    # 入金（仅机器人管理员 / 超级管理员）
     if text.startswith("+"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         amt, country = parse_amount_and_country(text)
         if amt is None:
@@ -1083,9 +1093,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 出金（四舍五入）
+    # 出金（仅机器人管理员 / 超级管理员）
     if text.startswith("-"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         amt, country = parse_amount_and_country(text)
         if amt is None:
@@ -1119,9 +1129,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 下发USDT（截断）
+    # 下发USDT（仅机器人管理员 / 超级管理员）
     if text.startswith("下发"):
-        if not await has_group_manage_permission(update, context, user.id):
+        if not is_bot_admin(user.id):
             return
         try:
             usdt_str = text.replace("下发", "").strip()
@@ -1157,7 +1167,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # 查看更多记录
+    # 查看更多记录（所有人可看）
     if text in ["更多记录", "查看更多记录", "更多账单", "显示历史账单"]:
         await update.message.reply_text(render_full_summary(chat_id))
         return
