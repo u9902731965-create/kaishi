@@ -74,6 +74,7 @@ def load_group_state(chat_id: int) -> dict:
                 },
             )
             state.setdefault("countries", {})
+            # 旧数据没有 bot_name 时使用默认名称
             state.setdefault("bot_name", "东起国际账单")
             state.setdefault("last_date", "")
             groups_state[chat_id] = state
@@ -310,16 +311,13 @@ def is_bot_admin(user_id: int) -> bool:
     return user_id in admin_list
 
 
-async def can_manage_bot_admin(
-    update, context, user_id: int
-) -> bool:
+async def can_manage_bot_admin(update, context, user_id: int) -> bool:
     """
     能否设置/删除机器人管理员：
     - 超级管理员(OWNER_ID) ✅
     - 群主(creator) ✅
     - 其它任何人（包括群管理员 administrator）❌
     """
-    # 超级管理员永远有权限
     if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
         return True
 
@@ -329,7 +327,7 @@ async def can_manage_bot_admin(
 
     try:
         member = await context.bot.get_chat_member(chat.id, user_id)
-        # 只允许群主操作，不再允许普通管理员
+        # 只有群主可以设置/删除机器人管理员
         return member.status == "creator"
     except Exception:
         return False
@@ -359,7 +357,7 @@ def render_group_summary(chat_id: int) -> str:
     normal_out = [r for r in rec_out if r.get("type") != "下发"]
     send_out = [r for r in rec_out if r.get("type") == "下发"]
 
-    # 入金记录（仍使用截断）
+    # 入金记录（截断）
     lines.append(f"已入账 ({len(rec_in)}笔)")
     if rec_in:
         for r in rec_in[:5]:
@@ -458,7 +456,7 @@ def render_full_summary(chat_id: int) -> str:
     if send_out:
         lines.append(f"已下发 ({len(send_out)}笔)")
         for r in send_out:
-            usdt = trunc2(abs(r["usdt"])))
+            usdt = trunc2(abs(r["usdt"]))  # 修复括号错误
             lines.append(f"{r['ts']} {usdt}")
         lines.append("")
 
@@ -481,20 +479,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-
-
-async def is_group_owner_or_admin(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> bool:
-    """检查用户是否是群主或群管理员（Telegram 层面的）—— 当前未用于权限，只作工具保留"""
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        return False
-    try:
-        member = await context.bot.get_chat_member(chat.id, user_id)
-        return member.status in ("creator", "administrator")
-    except Exception:
-        return False
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -538,8 +522,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💬 发送 /start 查看说明\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "📌 如何成为机器人管理员：\n\n"
-                "第1步：联系群主\n"
-                "第2步：让群主在群里回复你的消息并发送「设置管理员」\n"
+                "第1步：在群里找到群主\n"
+                "第2步：让群主回复你的消息并发送「设置管理员」\n"
                 "第3步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
             )
     else:
@@ -562,10 +546,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  设置入金汇率 153\n"
             "  设置出金费率 2\n"
             "  设置出金汇率 137\n\n"
-            "👥 管理机器人管理员（仅群主 / 超级管理员）：\n"
-            "  设置管理员（回复消息）\n"
-            "  删除管理员（回复消息）\n"
-            "  显示管理员"
+            "👥 管理机器人管理员：\n"
+            "  群主 / 超级管理员 可以：设置管理员 / 删除管理员\n"
+            "  任何人可以：显示管理员"
         )
 
 
@@ -590,6 +573,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             owner_id = int(OWNER_ID)
 
             if user.id != owner_id:
+                # 普通用户 -> 转发给客服(OWNER)
                 try:
                     user_info = f"👤 {user.full_name}"
                     if user.username:
@@ -623,7 +607,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"转发私聊消息失败: {e}")
             else:
-                # OWNER 逻辑（回复 / 广播）
+                # OWNER 自己发来的消息：可以“回复用户”或“广播”
                 if update.message.reply_to_message:
                     replied_msg_id = update.message.reply_to_message.message_id
                     if "private_msg_map" in context.bot_data:
@@ -651,6 +635,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await update.message.reply_text(f"❌ 发送失败: {e}")
                                 return
 
+                # 广播指令
                 if text.startswith("广播 ") or text.startswith("群发 "):
                     parts = text.split(" ", 1)
                     broadcast_text = parts[1] if len(parts) > 1 else ""
@@ -734,6 +719,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith(("设置管理员", "删除管理员", "显示管理员")):
         lst = list_admins()
         if text.startswith("显示"):
+            # 显示管理员：所有人可用
             lines = ["👥 机器人管理员列表\n"]
             lines.append(f"⭐ 超级管理员：{OWNER_ID or '未设置'}\n")
 
