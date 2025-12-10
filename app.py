@@ -39,7 +39,7 @@ def get_default_state() -> dict:
         },
         "countries": {},
         "precision": {"mode": "truncate", "digits": 2},
-        "bot_name": "东起国际账单",
+        "bot_name": "东启国际账单",
         "recent": {"in": [], "out": []},  # out 里同时存 普通出金 + 下发
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},
         "last_date": "",
