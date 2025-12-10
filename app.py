@@ -14,7 +14,15 @@ import requests  # 当前没有用到，用于以后需要时保留
 # ========== 加载环境 ==========
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")  # 可选：你的 Telegram ID（字符串），拥有超级管理员权限
+# 支持多个超级管理员，环境变量 OWNER_ID 形如： "7121576441,7566107299"
+OWNER_ID_RAW = os.getenv("OWNER_ID", "")
+
+SUPER_ADMINS: set[int] = {
+    int(x.strip())
+    for x in OWNER_ID_RAW.split(",")
+    if x.strip().isdigit()
+}
+PRIMARY_OWNER_ID: int | None = next(iter(SUPER_ADMINS)) if SUPER_ADMINS else None
 
 # ========== 记账核心状态（多群组支持）==========
 DATA_DIR = Path("./data")
@@ -39,7 +47,7 @@ def get_default_state() -> dict:
         },
         "countries": {},
         "precision": {"mode": "truncate", "digits": 2},
-        "bot_name": "东启国际账单",
+        "bot_name": "东起国际账单",
         "recent": {"in": [], "out": []},  # out 里同时存 普通出金 + 下发
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},
         "last_date": "",
@@ -74,8 +82,7 @@ def load_group_state(chat_id: int) -> dict:
                 },
             )
             state.setdefault("countries", {})
-            # 旧数据没有 bot_name 时使用默认名称
-            state.setdefault("bot_name", "东起国际账单")
+            state.setdefault("bot_name", "全球国际支付")
             state.setdefault("last_date", "")
             groups_state[chat_id] = state
             return state
@@ -106,29 +113,6 @@ def save_group_state(chat_id: int):
 admins_cache: list[int] | None = None
 
 
-def load_admins() -> list[int]:
-    """从JSON文件加载机器人管理员列表"""
-    global admins_cache
-    if admins_cache is not None:
-        return admins_cache
-
-    if ADMINS_FILE.exists():
-        try:
-            with ADMINS_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                admins_cache = data.get("admins", [])
-                return admins_cache
-        except Exception as e:
-            print(f"⚠️ 加载管理员文件失败: {e}")
-
-    # 初始化管理员（如果有OWNER_ID）
-    admins_cache = []
-    if OWNER_ID and OWNER_ID.isdigit():
-        admins_cache.append(int(OWNER_ID))
-    save_admins(admins_cache)
-    return admins_cache
-
-
 def save_admins(admin_list: list[int]):
     """保存机器人管理员列表到JSON文件"""
     global admins_cache
@@ -138,6 +122,32 @@ def save_admins(admin_list: list[int]):
             json.dump({"admins": admin_list}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"❌ 保存管理员文件失败: {e}")
+
+
+def load_admins() -> list[int]:
+    """从JSON文件加载机器人管理员列表（自动包含所有超级管理员）"""
+    global admins_cache
+    if admins_cache is not None:
+        return admins_cache
+
+    admins: list[int] = []
+    if ADMINS_FILE.exists():
+        try:
+            with ADMINS_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                admins = data.get("admins", [])
+        except Exception as e:
+            print(f"⚠️ 加载管理员文件失败: {e}")
+            admins = []
+
+    # 确保所有超级管理员也在机器人管理员列表里
+    for sid in SUPER_ADMINS:
+        if sid not in admins:
+            admins.append(sid)
+
+    admins_cache = admins
+    save_admins(admins_cache)
+    return admins_cache
 
 
 def add_admin(user_id: int) -> bool:
@@ -300,12 +310,17 @@ def parse_amount_and_country(text: str):
 
 
 # ========== 权限系统 ==========
+def is_super_admin(user_id: int) -> bool:
+    """是否为超级管理员（来自 OWNER_ID 列表）"""
+    return user_id in SUPER_ADMINS
+
+
 def is_bot_admin(user_id: int) -> bool:
     """
     机器人管理员 / 超级管理员：
-    - 可以操作所有记账功能（入金/出金/下发/撤销/清空/改费率等）
+    - 可以操作所有记账功能
     """
-    if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
+    if is_super_admin(user_id):
         return True
     admin_list = load_admins()
     return user_id in admin_list
@@ -314,23 +329,10 @@ def is_bot_admin(user_id: int) -> bool:
 async def can_manage_bot_admin(update, context, user_id: int) -> bool:
     """
     能否设置/删除机器人管理员：
-    - 超级管理员(OWNER_ID) ✅
-    - 群主(creator) ✅
-    - 其它任何人（包括群管理员 administrator）❌
+    - 只有超级管理员可以
+    - 群主 / 群管理没有任何控制机器人权限
     """
-    if OWNER_ID and OWNER_ID.isdigit() and int(OWNER_ID) == user_id:
-        return True
-
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        return False
-
-    try:
-        member = await context.bot.get_chat_member(chat.id, user_id)
-        # 只有群主可以设置/删除机器人管理员
-        return member.status == "creator"
-    except Exception:
-        return False
+    return is_super_admin(user_id)
 
 
 def list_admins() -> list[int]:
@@ -357,7 +359,7 @@ def render_group_summary(chat_id: int) -> str:
     normal_out = [r for r in rec_out if r.get("type") != "下发"]
     send_out = [r for r in rec_out if r.get("type") == "下发"]
 
-    # 入金记录（截断）
+    # 入金记录（仍使用截断）
     lines.append(f"已入账 ({len(rec_in)}笔)")
     if rec_in:
         for r in rec_in[:5]:
@@ -399,7 +401,12 @@ def render_group_summary(chat_id: int) -> str:
     lines.append(f"固定汇率：入 {fin} ⇄ 出 {fout}")
     lines.append(f"应下发：{fmt_usdt(should)}")
     lines.append(f"已下发：{fmt_usdt(sent)}")
-    lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
+
+    status_icon = "❗" if diff != 0 else "✅"
+    if diff >= 0:
+        lines.append(f"{status_icon} 未下发：{fmt_usdt(diff)}")
+    else:
+        lines.append(f"{status_icon} 多下发：{fmt_usdt(abs(diff))}")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("**查看更多记录**：发送「更多记录」")
     return "\n".join(lines)
@@ -456,7 +463,7 @@ def render_full_summary(chat_id: int) -> str:
     if send_out:
         lines.append(f"已下发 ({len(send_out)}笔)")
         for r in send_out:
-            usdt = trunc2(abs(r["usdt"]))  # 修复括号错误
+            usdt = trunc2(abs(r["usdt"]))
             lines.append(f"{r['ts']} {usdt}")
         lines.append("")
 
@@ -465,7 +472,12 @@ def render_full_summary(chat_id: int) -> str:
     lines.append(f"💱 固定汇率：入 {fin} ⇄ 出 {fout}")
     lines.append(f"📊 应下发：{fmt_usdt(should)}")
     lines.append(f"📤 已下发：{fmt_usdt(sent)}")
-    lines.append(f"{'❗' if diff != 0 else '✅'} 未下发：{fmt_usdt(diff)}")
+
+    status_icon = "❗" if diff != 0 else "✅"
+    if diff >= 0:
+        lines.append(f"{status_icon} 未下发：{fmt_usdt(diff)}")
+    else:
+        lines.append(f"{status_icon} 多下发：{fmt_usdt(abs(diff))}")
     lines.append("━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -511,7 +523,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔧 国家专属设置：\n"
                 "  设置 日本 入 费率 8\n"
                 "  设置 日本 入 汇率 127\n\n"
-                "👥 管理机器人管理员（仅群主 / 超级管理员）：\n"
+                "👥 管理机器人管理员（仅超级管理员）：\n"
                 "  设置管理员（回复消息）\n"
                 "  删除管理员（回复消息）\n"
                 "  显示管理员"
@@ -522,8 +534,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💬 发送 /start 查看说明\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "📌 如何成为机器人管理员：\n\n"
-                "第1步：在群里找到群主\n"
-                "第2步：让群主回复你的消息并发送「设置管理员」\n"
+                "第1步：在群里找到超级管理员\n"
+                "第2步：让超级管理员回复你的消息并发送「设置管理员」\n"
                 "第3步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
             )
     else:
@@ -532,7 +544,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
             "  入金：+10000 或 +10000 / 日本（支持 +1千 / +1万）\n"
             "  出金：-10000 或 -10000 / 日本（结果四舍五入）\n"
-            "  查看账单：+0 或 更多记录（所有人可用）\n\n"
+            "  查看账单：+0 或 更多记录\n\n"
             "💰 USDT下发（仅机器人管理员 / 超级管理员）：\n"
             "  下发35.04（记录下发并扣除应下发）\n"
             "  下发-35.04（撤销下发并增加应下发）\n\n"
@@ -546,9 +558,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  设置入金汇率 153\n"
             "  设置出金费率 2\n"
             "  设置出金汇率 137\n\n"
-            "👥 管理机器人管理员：\n"
-            "  群主 / 超级管理员 可以：设置管理员 / 删除管理员\n"
-            "  任何人可以：显示管理员"
+            "👥 管理机器人管理员（仅超级管理员）：\n"
+            "  设置管理员（回复消息）\n"
+            "  删除管理员（回复消息）\n"
+            "  显示管理员"
         )
 
 
@@ -569,11 +582,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(user_log_file, "a", encoding="utf-8") as f:
             f.write(log_entry)
 
-        if OWNER_ID and OWNER_ID.isdigit():
-            owner_id = int(OWNER_ID)
+        if PRIMARY_OWNER_ID is not None:
+            owner_id = PRIMARY_OWNER_ID
 
             if user.id != owner_id:
-                # 普通用户 -> 转发给客服(OWNER)
+                # 普通用户 -> 转发给主客服（第一个超级管理员）
                 try:
                     user_info = f"👤 {user.full_name}"
                     if user.username:
@@ -607,7 +620,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"转发私聊消息失败: {e}")
             else:
-                # OWNER 自己发来的消息：可以“回复用户”或“广播”
+                # 主客服（第一个超级管理员）的控制面板
                 if update.message.reply_to_message:
                     replied_msg_id = update.message.reply_to_message.message_id
                     if "private_msg_map" in context.bot_data:
@@ -635,7 +648,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await update.message.reply_text(f"❌ 发送失败: {e}")
                                 return
 
-                # 广播指令
                 if text.startswith("广播 ") or text.startswith("群发 "):
                     parts = text.split(" ", 1)
                     broadcast_text = parts[1] if len(parts) > 1 else ""
@@ -651,7 +663,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             for log_file in private_log_dir.glob("user_*.log"):
                                 try:
                                     uid = int(log_file.stem.split("user_")[1])
-                                    if uid != int(OWNER_ID):
+                                    # 不给所有超级管理员群发
+                                    if uid not in SUPER_ADMINS:
                                         user_ids.append(uid)
                                 except Exception:
                                     continue
@@ -719,9 +732,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith(("设置管理员", "删除管理员", "显示管理员")):
         lst = list_admins()
         if text.startswith("显示"):
-            # 显示管理员：所有人可用
             lines = ["👥 机器人管理员列表\n"]
-            lines.append(f"⭐ 超级管理员：{OWNER_ID or '未设置'}\n")
+            if SUPER_ADMINS:
+                owners_str = ", ".join(str(i) for i in sorted(SUPER_ADMINS))
+            else:
+                owners_str = "未设置"
+            lines.append(f"⭐ 超级管理员：{owners_str}\n")
 
             if lst:
                 lines.append("📋 机器人管理员：")
@@ -747,9 +763,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines))
             return
 
-        # 设置 / 删除 管理员 —— 仅 群主 / 超级管理员
+        # 设置 / 删除 管理员 —— 仅超级管理员
         if not await can_manage_bot_admin(update, context, user.id):
-            await update.message.reply_text("🚫 只有群主或超级管理员可以设置机器人管理员。")
+            await update.message.reply_text("🚫 只有超级管理员可以设置或删除机器人管理员。")
             return
 
         target = None
@@ -1191,9 +1207,10 @@ def init_bot():
         print("❌ 错误：未找到 TELEGRAM_BOT_TOKEN 环境变量")
         exit(1)
 
+    owners_str = ", ".join(str(i) for i in sorted(SUPER_ADMINS)) or "未设置"
     print("✅ Bot Token 已加载")
     print(f"📊 数据目录: {DATA_DIR}")
-    print(f"👑 超级管理员(OWNER_ID): {OWNER_ID or '未设置'}")
+    print(f"👑 超级管理员(OWNER_ID): {owners_str}")
 
     port = int(os.getenv("PORT", "10000"))
     print(f"\n🌐 启动HTTP健康检查服务器（端口 {port}）...")
