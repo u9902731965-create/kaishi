@@ -49,8 +49,7 @@ def get_default_state() -> dict:
         "precision": {"mode": "truncate", "digits": 2},
         "bot_name": "东启海外支付",
         "recent": {"in": [], "out": []},  # out 里同时存 普通出金 + 下发
-        # should_send_usdt：入金 - 下发
-        # sent_usdt：累计“下发USDT”金额（出金不再计入）
+        # 这两个字段保留，但不再用于“未下发”计算，只是兼容旧数据
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},
         "last_date": "",
     }
@@ -84,7 +83,7 @@ def load_group_state(chat_id: int) -> dict:
                 },
             )
             state.setdefault("countries", {})
-            state.setdefault("bot_name", "全球国际支付")
+            state.setdefault("bot_name", "东启海外支付")
             state.setdefault("last_date", "")
             groups_state[chat_id] = state
             return state
@@ -342,17 +341,35 @@ def list_admins() -> list[int]:
     return load_admins()
 
 
+# ========== 汇总计算 ==========
+def compute_totals(state: dict) -> tuple[float, float, float]:
+    """
+    返回 (总入金USDT, 总出金USDT, 未下发USDT)
+    未下发 = 总入金 - 总出金
+    出金只统计普通出金（type != '下发'），下发单独展示
+    """
+    rec_in = state["recent"]["in"]
+    rec_out = state["recent"]["out"]
+
+    normal_out = [r for r in rec_out if r.get("type") != "下发"]
+
+    total_in = trunc2(sum(float(r.get("usdt", 0.0)) for r in rec_in))
+    total_out = trunc2(
+        sum(abs(float(r.get("usdt", 0.0))) for r in normal_out)
+    )
+    pending = trunc2(total_in - total_out)
+    return total_in, total_out, pending
+
+
 # ========== 群内汇总显示 ==========
 def render_group_summary(chat_id: int) -> str:
     state = load_group_state(chat_id)
     bot = state["bot_name"]
     rec_in, rec_out = state["recent"]["in"], state["recent"]["out"]
-    should = trunc2(state["summary"]["should_send_usdt"])
-    sent = trunc2(state["summary"]["sent_usdt"])
-    diff = trunc2(should - sent)  # 只与 入金 & 下发 有关，出金不影响
-
     rin, fin = state["defaults"]["in"]["rate"], state["defaults"]["in"]["fx"]
     rout, fout = state["defaults"]["out"]["rate"], state["defaults"]["out"]["fx"]
+
+    total_in, total_out, pending = compute_totals(state)
 
     lines: list[str] = []
     lines.append(f"【{bot} 账单汇总】\n")
@@ -392,7 +409,7 @@ def render_group_summary(chat_id: int) -> str:
 
     # 下发记录（保持截断展示）
     if send_out:
-        lines.append(f"已下发 ({len(send_out)}笔)")
+        lines.append(f"已下发记录 ({len(send_out)}笔)")
         for r in send_out[:5]:
             usdt = trunc2(abs(r["usdt"]))
             lines.append(f"{r['ts']} {usdt}")
@@ -401,14 +418,9 @@ def render_group_summary(chat_id: int) -> str:
     lines.append("━━━━━━━━━━━━━━")
     lines.append(f"当前费率：入 {rin * 100:.0f}% ⇄ 出 {abs(rout) * 100:.0f}%")
     lines.append(f"固定汇率：入 {fin} ⇄ 出 {fout}")
-    lines.append(f"应下发：{fmt_usdt(should)}")
-    lines.append(f"已下发：{fmt_usdt(sent)}")
-
-    status_icon = "❗" if diff != 0 else "✅"
-    if diff >= 0:
-        lines.append(f"{status_icon} 未下发：{fmt_usdt(diff)}")
-    else:
-        lines.append(f"{status_icon} 多下发：{fmt_usdt(abs(diff))}")
+    lines.append(f"应下发：{fmt_usdt(total_in)}")
+    lines.append(f"已下发：{fmt_usdt(total_out)}")
+    lines.append(f"未下发：{fmt_usdt(pending)}")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("**查看更多记录**：发送「更多记录」")
     return "\n".join(lines)
@@ -419,12 +431,10 @@ def render_full_summary(chat_id: int) -> str:
     state = load_group_state(chat_id)
     bot = state["bot_name"]
     rec_in, rec_out = state["recent"]["in"], state["recent"]["out"]
-    should = trunc2(state["summary"]["should_send_usdt"])
-    sent = trunc2(state["summary"]["sent_usdt"])
-    diff = trunc2(should - sent)
-
     rin, fin = state["defaults"]["in"]["rate"], state["defaults"]["in"]["fx"]
     rout, fout = state["defaults"]["out"]["rate"], state["defaults"]["out"]["fx"]
+
+    total_in, total_out, pending = compute_totals(state)
 
     lines: list[str] = []
     lines.append(f"【{bot} 完整账单】\n")
@@ -463,7 +473,7 @@ def render_full_summary(chat_id: int) -> str:
 
     # 下发记录
     if send_out:
-        lines.append(f"已下发 ({len(send_out)}笔)")
+        lines.append(f"已下发记录 ({len(send_out)}笔)")
         for r in send_out:
             usdt = trunc2(abs(r["usdt"]))
             lines.append(f"{r['ts']} {usdt}")
@@ -472,14 +482,9 @@ def render_full_summary(chat_id: int) -> str:
     lines.append("━━━━━━━━━━━━━━")
     lines.append(f"⚙️ 当前费率：入 {rin * 100:.0f}% ⇄ 出 {abs(rout) * 100:.0f}%")
     lines.append(f"💱 固定汇率：入 {fin} ⇄ 出 {fout}")
-    lines.append(f"📊 应下发：{fmt_usdt(should)}")
-    lines.append(f"📤 已下发：{fmt_usdt(sent)}")
-
-    status_icon = "❗" if diff != 0 else "✅"
-    if diff >= 0:
-        lines.append(f"{status_icon} 未下发：{fmt_usdt(diff)}")
-    else:
-        lines.append(f"{status_icon} 多下发：{fmt_usdt(abs(diff))}")
+    lines.append(f"📊 应下发：{fmt_usdt(total_in)}")
+    lines.append(f"📤 已下发：{fmt_usdt(total_out)}")
+    lines.append(f"📌 未下发：{fmt_usdt(pending)}")
     lines.append("━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -506,14 +511,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🤖 你好，我是财务记账机器人。\n\n"
                 "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
                 "  入金：+10000 或 +10000 / 日本\n"
-                "  出金：-10000 或 -10000 / 日本\n"
+                "  出金：-10000 或 -10000 / 日本（结果为负数）\n"
                 "  支持：+1千 / +1万 / +1.5万 等简写\n"
                 "  查看账单：+0 或 更多记录\n\n"
-                "💰 USDT下发：\n"
-                "  下发35.04（记录下发并扣除应下发）\n"
-                "  下发-35.04（撤销下发并增加应下发）\n\n"
                 "🔄 撤销功能：\n"
-                "  撤销入金 / 撤销出金 / 撤销下发\n\n"
+                "  撤销入金 / 撤销出金\n\n"
                 "🧹 清空数据：\n"
                 "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
                 "⚙️ 快速设置：\n"
@@ -536,22 +538,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💬 发送 /start 查看说明\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "📌 如何成为机器人管理员：\n\n"
-                "第1步：在群里找到超级管理员\n"
+                "第1步：联系超级管理员\n"
                 "第2步：让超级管理员回复你的消息并发送「设置管理员」\n"
-                "第3步：你就可以在群里使用 +10000 / -10000 / 下发 等功能了"
+                "第3步：你就可以在群里使用 +10000 / -10000 等功能了"
             )
     else:
         await update.message.reply_text(
-            "🤖 你好，我是财务记账机器人。\n\n"
+            "🤖 你好，我是财务记账机器人（东启海外支付）。\n\n"
             "📊 记账操作（仅机器人管理员 / 超级管理员）：\n"
             "  入金：+10000 或 +10000 / 日本（支持 +1千 / +1万）\n"
-            "  出金：-10000 或 -10000 / 日本（结果记为负数）\n"
+            "  出金：-10000 或 -10000 / 日本（结果为负数，参与未下发统计）\n"
             "  查看账单：+0 或 更多记录\n\n"
-            "💰 USDT下发（仅机器人管理员 / 超级管理员）：\n"
-            "  下发35.04（记录下发并扣除应下发）\n"
-            "  下发-35.04（撤销下发并增加应下发）\n\n"
             "🔄 撤销功能（仅机器人管理员 / 超级管理员）：\n"
-            "  撤销入金 / 撤销出金 / 撤销下发\n\n"
+            "  撤销入金 / 撤销出金\n\n"
             "🧹 清空数据（仅机器人管理员 / 超级管理员）：\n"
             "  清除数据 / 清空数据 / 清楚数据 / 清除账单 / 清空账单\n\n"
             "⚙️ 快速设置（仅机器人管理员 / 超级管理员）：\n"
@@ -650,57 +649,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await update.message.reply_text(f"❌ 发送失败: {e}")
                                 return
 
-                if text.startswith("广播 ") or text.startswith("群发 "):
-                    parts = text.split(" ", 1)
-                    broadcast_text = parts[1] if len(parts) > 1 else ""
-                    if not broadcast_text:
-                        await update.message.reply_text(
-                            "❌ 请输入广播内容，例如：广播 今天有新活动"
-                        )
-                        return
-
-                    user_ids: list[int] = []
-                    try:
-                        if private_log_dir.exists():
-                            for log_file in private_log_dir.glob("user_*.log"):
-                                try:
-                                    uid = int(log_file.stem.split("user_")[1])
-                                    # 不给所有超级管理员群发
-                                    if uid not in SUPER_ADMINS:
-                                        user_ids.append(uid)
-                                except Exception:
-                                    continue
-                    except Exception as e:
-                        await update.message.reply_text(
-                            f"❌ 读取用户列表失败: {e}"
-                        )
-                        return
-
-                    if not user_ids:
-                        await update.message.reply_text("❌ 暂无任何私聊用户")
-                        return
-
-                    await update.message.reply_text(
-                        f"📢 开始广播，目标用户：{len(user_ids)}"
-                    )
-                    success, fail = 0, 0
-                    for uid in user_ids:
-                        try:
-                            await context.bot.send_message(
-                                uid, f"📢 系统通知：\n\n{broadcast_text}"
-                            )
-                            success += 1
-                        except Exception:
-                            fail += 1
-                    await update.message.reply_text(
-                        f"✅ 广播完成：成功 {success}，失败 {fail}"
-                    )
-                    return
-
                 await update.message.reply_text(
                     "💡 使用提示：\n"
                     "• 回复转发的消息可以直接回用户\n"
-                    "• 使用『广播 内容』可群发给所有私聊用户"
+                    "• 如需群发给所有私聊用户，可另行添加相应功能"
                 )
                 return
 
@@ -715,7 +667,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         new_name = text.replace("设置账单名称", "", 1).strip()
         if not new_name:
-            await update.message.reply_text("❌ 请输入账单名称，例如：设置账单名称 东起")
+            await update.message.reply_text("❌ 请输入账单名称，例如：设置账单名称 东启海外支付")
             return
 
         state["bot_name"] = new_name
@@ -866,7 +818,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         state["defaults"] = {
             "in": {"rate": 0.10, "fx": 153},
-            "out": {"rate": 0.02, "fx": 137},  # 出金费率用正 0.02，公式里 (1 + rate)
+            "out": {"rate": 0.02, "fx": 137},
         }
         save_group_state(chat_id)
 
@@ -954,10 +906,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("清除数据", "清空数据", "清楚数据", "清除账单", "清空账单"):
         if not is_bot_admin(user.id):
             return
+
+        total_in, total_out, pending = compute_totals(state)
         in_count = len(state["recent"]["in"])
         out_count = len(state["recent"]["out"])
-        should_before = trunc2(state["summary"]["should_send_usdt"])
-        sent_before = trunc2(state["summary"]["sent_usdt"])
 
         state["recent"]["in"] = []
         state["recent"]["out"] = []
@@ -967,10 +919,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = (
             "✅ 已清除今日所有数据（00:00 至现在）\n\n"
-            f"📥 入金记录：{in_count} 笔\n"
-            f"📤 出金 + 下发记录：{out_count} 笔\n"
-            f"🧾 清除前应下发：{fmt_usdt(should_before)}\n"
-            f"📤 清除前已下发：{fmt_usdt(sent_before)}"
+            f"📥 入金记录：{in_count} 笔，总计：{fmt_usdt(total_in)}\n"
+            f"📤 出金 + 下发记录：{out_count} 笔，出金合计：{fmt_usdt(total_out)}\n"
+            f"📌 清除前未下发：{fmt_usdt(pending)}"
         )
         await update.message.reply_text(msg)
         await update.message.reply_text(render_group_summary(chat_id))
@@ -986,9 +937,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         last = rec_in.pop(0)  # 最新一笔
         usdt = float(last.get("usdt", 0.0))
-        state["summary"]["should_send_usdt"] = trunc2(
-            state["summary"]["should_send_usdt"] - usdt
-        )
         save_group_state(chat_id)
         append_log(
             log_path(chat_id, last.get("country"), dstr),
@@ -1016,7 +964,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         last = rec_out.pop(target_idx)
         usdt = float(last.get("usdt", 0.0))  # 负数
-        # 出金现在不影响 summary，只删除记录 + 写日志
         save_group_state(chat_id)
         append_log(
             log_path(chat_id, last.get("country"), dstr),
@@ -1025,50 +972,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ 已撤销最近一笔出金：{last.get('raw')} → {usdt} USDT"
         )
-        await update.message.reply_text(render_group_summary(chat_id))
-        return
-
-    # 🔄 撤销下发（仅机器人管理员 / 超级管理员）
-    if text == "撤销下发":
-        if not is_bot_admin(user.id):
-            return
-        rec_out = state["recent"]["out"]
-        target_idx = None
-        for idx, r in enumerate(rec_out):
-            if r.get("type") == "下发":
-                target_idx = idx
-                break
-        if target_idx is None:
-            await update.message.reply_text("ℹ️ 今日暂无下发记录，无需撤销")
-            return
-        last = rec_out.pop(target_idx)
-        usdt = float(last.get("usdt", 0.0))  # 正或负
-
-        # 还原应下发 & 已下发
-        if usdt > 0:
-            # 原来是下发正数：应下发+usdt，已下发-usdt
-            state["summary"]["should_send_usdt"] = trunc2(
-                state["summary"]["should_send_usdt"] + usdt
-            )
-            state["summary"]["sent_usdt"] = trunc2(
-                state["summary"]["sent_usdt"] - usdt
-            )
-        else:
-            # 原来是“下发-xx”（撤销下发记录）：应下发-usdt_abs，已下发+usdt_abs
-            usdt_abs = abs(usdt)
-            state["summary"]["should_send_usdt"] = trunc2(
-                state["summary"]["should_send_usdt"] - usdt_abs
-            )
-            state["summary"]["sent_usdt"] = trunc2(
-                state["summary"]["sent_usdt"] + usdt_abs
-            )
-
-        save_group_state(chat_id)
-        append_log(
-            log_path(chat_id, None, dstr),
-            f"[撤销下发记录] 时间:{ts} USDT:{usdt}",
-        )
-        await update.message.reply_text(f"✅ 已撤销最近一笔下发记录：{usdt} USDT")
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
@@ -1097,10 +1000,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "rate": p["rate"],
             },
         )
-        # 入金只增加“应下发”
-        state["summary"]["should_send_usdt"] = trunc2(
-            state["summary"]["should_send_usdt"] + usdt
-        )
         save_group_state(chat_id)
         append_log(
             log_path(chat_id, country, dstr),
@@ -1122,7 +1021,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         usdt_calc = round2(amt * (1 + p["rate"]) / p["fx"])
-        usdt = -usdt_calc  # 出金记为负数，只做记录，不动 summary
+        usdt = -usdt_calc  # 出金记为负数
 
         push_recent(
             chat_id,
@@ -1144,7 +1043,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_group_summary(chat_id))
         return
 
-    # 下发USDT（仅机器人管理员 / 超级管理员）
+    # 下发USDT 指令暂时保留，只记录，不参与“未下发”计算
     if text.startswith("下发"):
         if not is_bot_admin(user.id):
             return
@@ -1152,41 +1051,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             usdt_str = text.replace("下发", "").strip()
             usdt = trunc2(float(usdt_str))
 
-            if usdt > 0:
-                # 实际下发：应下发减少，已下发增加
-                state["summary"]["should_send_usdt"] = trunc2(
-                    state["summary"]["should_send_usdt"] - usdt
-                )
-                state["summary"]["sent_usdt"] = trunc2(
-                    state["summary"]["sent_usdt"] + usdt
-                )
-                push_recent(chat_id, "out", {"ts": ts, "usdt": usdt, "type": "下发"})
-                append_log(
-                    log_path(chat_id, None, dstr),
-                    f"[下发USDT] 时间:{ts} 金额:{usdt} USDT",
-                )
-            else:
-                # 负数：撤销部分下发，应下发增加，已下发减少
-                usdt_abs = trunc2(abs(usdt))
-                state["summary"]["should_send_usdt"] = trunc2(
-                    state["summary"]["should_send_usdt"] + usdt_abs
-                )
-                state["summary"]["sent_usdt"] = trunc2(
-                    state["summary"]["sent_usdt"] - usdt_abs
-                )
-                push_recent(
-                    chat_id, "out", {"ts": ts, "usdt": usdt, "type": "下发"}
-                )
-                append_log(
-                    log_path(chat_id, None, dstr),
-                    f"[撤销下发] 时间:{ts} 金额:{usdt_abs} USDT",
-                )
-
+            push_recent(chat_id, "out", {"ts": ts, "usdt": usdt, "type": "下发"})
             save_group_state(chat_id)
+            append_log(
+                log_path(chat_id, None, dstr),
+                f"[下发记录] 时间:{ts} 金额:{usdt} USDT（仅记录，不参与未下发计算）",
+            )
             await update.message.reply_text(render_group_summary(chat_id))
         except ValueError:
             await update.message.reply_text(
-                "❌ 格式错误，请输入有效的数字\n例如：下发35.04 或 下发-35.04"
+                "❌ 格式错误，请输入有效的数字\n例如：下发35.04"
             )
         return
 
