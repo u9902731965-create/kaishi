@@ -428,7 +428,6 @@ def render_group_summary(chat_id: int) -> str:
 
     lines.append(f"当前费率： 入 {rin * 100:.0f}% ⇄ 出 {abs(rout) * 100:.0f}%")
     lines.append(f"固定汇率： 入 {fin} ⇄ 出 {fout}")
-    lines.append(f"出金手续费： {fee_usdt:.2f} USDT/笔（设置出金手续费 0 可关闭）")
     lines.append(f"应下发：{fmt_usdt(totals['should'])}")
     lines.append(f"已下发：{fmt_usdt(totals['sent'])}")
     lines.append(f"未下发：{fmt_usdt(totals['diff'])}")
