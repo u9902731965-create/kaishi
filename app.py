@@ -62,7 +62,7 @@ def get_default_state() -> Dict[str, Any]:
         },
         "countries": {},  # 可扩展国家专属设置（沿用你原来的结构）
         "precision": {"mode": "truncate", "digits": 2},
-        "bot_name": "全球海外支付",
+        "bot_name": "东启海外支付",
         "recent": {"in": [], "out": []},  # out 中包含普通出金 + 下发记录
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},  # 保留兼容，不参与计算
         "last_date": "",
