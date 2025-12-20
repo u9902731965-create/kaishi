@@ -60,12 +60,17 @@ def get_default_state() -> Dict[str, Any]:
             "in": {"rate": 0.0, "fx": 0.0},
             "out": {"rate": 0.0, "fx": 0.0, "fee_usdt": 0.0},  # 出金手续费（USDT/笔）
         },
-        "countries": {},  # 可扩展国家专属设置（沿用你原来的结构）
+        "countries": {},  # 可扩展国家专属设置
         "precision": {"mode": "truncate", "digits": 2},
         "bot_name": "东启海外支付",
         "recent": {"in": [], "out": []},  # out 中包含普通出金 + 下发记录
         "summary": {"should_send_usdt": 0.0, "sent_usdt": 0.0},  # 保留兼容，不参与计算
         "last_date": "",
+
+        # ✅ 新增：每日清空时间（北京时间），默认 00:00
+        "reset_time": "00:00",
+        # ✅ 新增：上一账期标识（用于判断是否需要清空）
+        "last_period": "",
     }
 
 
@@ -97,6 +102,10 @@ def load_group_state(chat_id: int) -> Dict[str, Any]:
             # 补齐出金手续费字段
             state["defaults"].setdefault("out", {})
             state["defaults"]["out"].setdefault("fee_usdt", 0.0)
+
+            # ✅ 新增字段兼容
+            state.setdefault("reset_time", "00:00")
+            state.setdefault("last_period", "")
 
             groups_state[chat_id] = state
             return state
@@ -203,33 +212,70 @@ def fmt_rate_percent(rate: float) -> str:
     return f"{s}%"
 
 
-def now_ts() -> str:
+def _beijing_now() -> datetime.datetime:
     beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-    return datetime.datetime.now(beijing_tz).strftime("%H:%M")
+    return datetime.datetime.now(beijing_tz)
+
+
+def now_ts() -> str:
+    return _beijing_now().strftime("%H:%M")
 
 
 def today_str() -> str:
-    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-    return datetime.datetime.now(beijing_tz).strftime("%Y-%m-%d")
+    return _beijing_now().strftime("%Y-%m-%d")
+
+
+def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hhmm = (hhmm or "").strip()
+    m = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", hhmm)
+    if not m:
+        return 0, 0
+    return int(m.group(1)), int(m.group(2))
+
+
+def _current_period_id(reset_time: str) -> str:
+    """
+    返回当前账期标识（YYYY-MM-DD），规则：
+    - 以北京时间 reset_time 为边界
+    - now >= 今日边界 => period = 今日
+    - 否则 period = 昨日
+    """
+    now = _beijing_now()
+    hh, mm = _parse_hhmm(reset_time)
+    boundary_today = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if now >= boundary_today:
+        period_date = boundary_today.date()
+    else:
+        period_date = (boundary_today - datetime.timedelta(days=1)).date()
+    return period_date.strftime("%Y-%m-%d")
 
 
 def check_and_reset_daily(chat_id: int) -> bool:
-    """跨天（北京时间 0 点）自动清空当天记录（在下一次群消息触发时执行）"""
+    """按设定清空时间（北京时间）跨账期自动清空（在下一次群消息触发时执行）"""
     state = load_group_state(chat_id)
-    current_date = today_str()
-    last_date = state.get("last_date", "")
 
-    if last_date and last_date != current_date:
+    reset_time = state.get("reset_time", "00:00")
+    period = _current_period_id(reset_time)
+    last_period = state.get("last_period", "")
+
+    # 初始化
+    if not last_period:
+        state["last_period"] = period
+        # 兼容：保留 last_date 字段（不影响）
+        state["last_date"] = today_str()
+        save_group_state(chat_id)
+        return False
+
+    # 跨账期：清空
+    if last_period != period:
         state["recent"]["in"] = []
         state["recent"]["out"] = []
         state["summary"]["should_send_usdt"] = 0.0
         state["summary"]["sent_usdt"] = 0.0
-        state["last_date"] = current_date
+        state["last_period"] = period
+        state["last_date"] = today_str()
         save_group_state(chat_id)
         return True
-    elif not last_date:
-        state["last_date"] = current_date
-        save_group_state(chat_id)
 
     return False
 
@@ -259,7 +305,7 @@ def push_recent(chat_id: int, kind: str, item: Dict[str, Any]) -> None:
 
 def resolve_params(chat_id: int, direction: str, country: Optional[str]) -> Dict[str, float]:
     """
-    兼容国家专属设置（沿用原逻辑）：
+    兼容国家专属设置：
     - rate / fx 若国家专属没设置，则用 defaults
     """
     state = load_group_state(chat_id)
@@ -318,14 +364,6 @@ def short_peer_name(name: str, n: int = 4) -> str:
     return name[:n]
 
 
-def extract_username(text: str) -> Optional[str]:
-    """
-    从文本中提取 @username（不含@）
-    """
-    m = re.search(r"@([A-Za-z0-9_]{5,})", text or "")
-    return m.group(1) if m else None
-
-
 # ========== 权限系统 ==========
 def is_super_admin(user_id: int) -> bool:
     """超级管理员判断：仅依赖环境变量"""
@@ -382,6 +420,7 @@ def _render_line_peer(r: Dict[str, Any]) -> str:
 def render_group_summary(chat_id: int) -> str:
     state = load_group_state(chat_id)
     bot = state.get("bot_name", "东启海外支付")
+    reset_time = state.get("reset_time", "00:00")
 
     totals = compute_totals(state)
     rec_in = totals["rec_in"]
@@ -428,6 +467,7 @@ def render_group_summary(chat_id: int) -> str:
         lines.append(f"{ts} {usdt}{_render_line_peer(r)}")
     lines.append("")
 
+    lines.append(f"清空时间（北京时间）：{reset_time}（账期 24 小时）")
     lines.append(f"当前费率： 入 {fmt_rate_percent(rin)} ⇄ 出 {fmt_rate_percent(abs(rout))}")
     lines.append(f"固定汇率： 入 {fin} ⇄ 出 {fout}")
     lines.append(f"应下发：{fmt_usdt(totals['should'])}")
@@ -441,6 +481,7 @@ def render_group_summary(chat_id: int) -> str:
 def render_full_summary(chat_id: int) -> str:
     state = load_group_state(chat_id)
     bot = state.get("bot_name", "东启海外支付")
+    reset_time = state.get("reset_time", "00:00")
 
     totals = compute_totals(state)
     rec_in = totals["rec_in"]
@@ -486,6 +527,7 @@ def render_full_summary(chat_id: int) -> str:
     lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
+    lines.append(f"清空时间（北京时间）：{reset_time}（账期 24 小时）")
     lines.append(f"当前费率： 入 {fmt_rate_percent(rin)} ⇄ 出 {fmt_rate_percent(abs(rout))}")
     lines.append(f"固定汇率： 入 {fin} ⇄ 出 {fout}")
     lines.append(f"出金手续费： {fee_usdt:.2f} USDT/笔")
@@ -526,6 +568,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🧾 出金手续费（仅机器人管理员 / 超级管理员）：\n"
                 "  设置出金手续费 1   （每笔出金 +1 USDT）\n"
                 "  设置出金手续费 0   （关闭手续费）\n\n"
+                "⏰ 清空时间（仅机器人管理员 / 超级管理员）：\n"
+                "  设置清空时间 06:00（北京时间，账期仍为 24 小时）\n"
+                "  查看清空时间\n\n"
                 "🔄 撤销功能（仅机器人管理员 / 超级管理员）：\n"
                 "  撤销入金 / 撤销出金 / 撤销下发\n\n"
                 "🧹 清空数据（仅机器人管理员 / 超级管理员）：\n"
@@ -537,10 +582,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  设置出金费率 2\n"
                 "  设置出金汇率 137\n\n"
                 "👥 机器人管理员管理（仅超级管理员）：\n"
-                "  设置管理员 @username\n"
-                "  @username 设置管理员\n"
                 "  设置管理员（回复用户消息）\n"
-                "  删除管理员（同上三种方式）\n"
+                "  删除管理员（回复用户消息）\n"
                 "  显示管理员\n\n"
                 "📌 提示：你在群里操作入金/出金/下发时，如果是“回复某人的消息”再发指令，账单会显示对方名字前4位。"
             )
@@ -562,44 +605,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  下发：下发100 / 下发-100\n"
             "  撤销：撤销入金 / 撤销出金 / 撤销下发\n"
             "  清空：清除数据 / 清空账单\n"
-            "  手续费：设置出金手续费 1（0关闭）\n\n"
+            "  手续费：设置出金手续费 1（0关闭）\n"
+            "  清空时间：设置清空时间 06:00（查看：查看清空时间）\n\n"
             "👥 仅超级管理员可用：\n"
-            "  设置管理员（回复/@用户名）/ 删除管理员 / 显示管理员"
+            "  设置管理员（回复用户消息）/ 删除管理员（回复用户消息）/ 显示管理员"
         )
 
 
 async def resolve_target_user_for_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Any]:
     """
-    解析要设置/删除的目标用户，支持：
-      1) 回复用户消息（最稳定）
-      2) text_mention（实体里直接带 user）
-      3) @username（尽最大努力尝试解析；若失败会返回 None）
+    仅支持：回复用户消息（最稳定）
     """
     msg = update.message
     if not msg:
         return None
 
-    # 1) 回复消息
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
-
-    # 2) text_mention
-    if msg.entities:
-        for entity in msg.entities:
-            if entity.type == "text_mention" and entity.user:
-                return entity.user
-
-    # 3) @username
-    uname = extract_username(msg.text or "")
-    if uname:
-        try:
-            chat_obj = await context.bot.get_chat(f"@{uname}")
-            # 对于用户：chat_obj.id 即 user_id（若 Telegram 允许解析）
-            if getattr(chat_obj, "id", None) is not None:
-                # 模拟一个最小 user 对象：直接返回 chat_obj（后面用 id/mention_html 兜底）
-                return chat_obj
-        except Exception:
-            return None
 
     return None
 
@@ -697,12 +719,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ========== 管理机器人管理员（仅超级管理员） ==========
-    # 支持：
-    #   设置管理员 @username
-    #   @username 设置管理员
-    #   设置管理员（回复用户）
-    # 同理删除管理员
-    if ("设置管理员" in text) or ("删除管理员" in text) or (text.strip() == "显示管理员"):
+    # 仅保留：回复用户消息 -> 发送「设置管理员」「删除管理员」
+    if text.strip() in ("设置管理员", "删除管理员", "显示管理员"):
         admins = list_admins()
 
         if text.strip() == "显示管理员":
@@ -753,25 +771,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not target or getattr(target, "id", None) is None:
             await update.message.reply_text(
-                "❌ 无法解析 @username（Telegram 限制）。\n"
-                "请让对方在群里发一句话，然后你【回复他的消息】发送：设置管理员\n"
-                "或：删除管理员"
+                "❌ 请先【回复对方的消息】再发送：设置管理员 或 删除管理员\n"
+                "示例：回复某人一句话 → 发送「设置管理员」"
             )
             return
 
         target_id = int(target.id)
 
-        # mention_html 兼容：chat_obj 可能没有该方法
+        # mention_html 兼容：target 可能没有该方法（这里 target 来自 reply，一般有）
         target_mention = ""
         try:
             target_mention = target.mention_html()
         except Exception:
-            # 尝试拼一个可读名称
             uname = getattr(target, "username", None)
-            fname = getattr(target, "full_name", None) or getattr(target, "title", None) or str(target_id)
+            fname = getattr(target, "full_name", None) or str(target_id)
             target_mention = f"{fname} (@{uname})" if uname else f"{fname} (ID:{target_id})"
 
-        if "设置管理员" in text:
+        if text.strip() == "设置管理员":
             add_admin(target_id)
             await update.message.reply_text(
                 f"✅ 已将 {target_mention} 设置为机器人管理员。",
@@ -779,7 +795,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if "删除管理员" in text:
+        if text.strip() == "删除管理员":
             remove_admin(target_id)
             await update.message.reply_text(
                 f"🗑️ 已移除 {target_mention} 的机器人管理员权限。",
@@ -800,6 +816,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["bot_name"] = new_name
         save_group_state(chat_id)
         await update.message.reply_text(f"✅ 账单名称已修改为：{new_name}")
+        return
+
+    # ========== 设置清空时间（北京时间） ==========
+    if text.startswith("设置清空时间"):
+        val = text.replace("设置清空时间", "", 1).strip()
+        m = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", val)
+        if not m:
+            await update.message.reply_text("❌ 格式：设置清空时间 HH:MM（例如：设置清空时间 06:00）")
+            return
+
+        state["reset_time"] = val
+        # 立即对齐当前账期，避免设置后下一条消息误判
+        state["last_period"] = _current_period_id(val)
+        save_group_state(chat_id)
+
+        await update.message.reply_text(f"✅ 已设置每日清空时间（北京时间）：{val}\n📌 账期长度仍为 24 小时。")
+        await update.message.reply_text(render_group_summary(chat_id))
+        return
+
+    if text.strip() in ("查看清空时间", "当前清空时间"):
+        rt = state.get("reset_time", "00:00")
+        await update.message.reply_text(f"⏰ 当前每日清空时间（北京时间）：{rt}\n📌 账期长度：24 小时。")
         return
 
     # ========== 设置出金手续费（USDT/笔） ==========
@@ -850,6 +888,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out_rate, out_rate_src = _get("out", "rate")
         out_fx, out_fx_src = _get("out", "fx")
         out_fee = float(defaults["out"].get("fee_usdt", 0.0))
+        reset_time = state.get("reset_time", "00:00")
 
         lines = [
             f"📍【{country} 当前点位】\n",
@@ -859,7 +898,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📤 出金设置：",
             f"  • 费率：{fmt_rate_percent(abs(float(out_rate)))} ({out_rate_src})",
             f"  • 汇率：{out_fx} ({out_fx_src})",
-            f"  • 手续费：{out_fee:.2f} USDT/笔（默认）",
+            f"  • 手续费：{out_fee:.2f} USDT/笔（默认）\n",
+            f"⏰ 清空时间（北京时间）：{reset_time}（账期 24 小时）",
         ]
         await update.message.reply_text("\n".join(lines))
         return
@@ -921,7 +961,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ========== 高级设置（指定国家）（费率支持小数） ==========
-    if text.startswith("设置") and not text.startswith(("设置入金", "设置出金", "设置账单名称", "设置出金手续费")):
+    if text.startswith("设置") and not text.startswith(("设置入金", "设置出金", "设置账单名称", "设置出金手续费", "设置清空时间")):
         pattern = r"^设置\s*(.+?)(入|出)(费率|汇率)\s*(\d+(?:\.\d+)?)\s*$"
         match = re.match(pattern, text)
         if match:
@@ -963,7 +1003,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_group_state(chat_id)
 
         msg = (
-            "✅ 已清除今日所有数据（北京时间 00:00 至现在）\n\n"
+            "✅ 已清除当前账期所有数据\n\n"
             f"📥 入金记录：{in_count} 笔\n"
             f"📤 出金 + 下发记录：{out_count} 笔\n"
             f"🧾 清除前应下发：{fmt_usdt(totals['should'])}\n"
@@ -977,7 +1017,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "撤销入金":
         rec_in = state["recent"]["in"]
         if not rec_in:
-            await update.message.reply_text("ℹ️ 今日暂无入金记录，无需撤销")
+            await update.message.reply_text("ℹ️ 当前账期暂无入金记录，无需撤销")
             return
         last = rec_in.pop(0)
         save_group_state(chat_id)
@@ -998,7 +1038,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_idx = idx
                 break
         if target_idx is None:
-            await update.message.reply_text("ℹ️ 今日暂无出金记录，无需撤销")
+            await update.message.reply_text("ℹ️ 当前账期暂无出金记录，无需撤销")
             return
         last = rec_out.pop(target_idx)
         save_group_state(chat_id)
@@ -1019,7 +1059,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_idx = idx
                 break
         if target_idx is None:
-            await update.message.reply_text("ℹ️ 今日暂无下发记录，无需撤销")
+            await update.message.reply_text("ℹ️ 当前账期暂无下发记录，无需撤销")
             return
         last = rec_out.pop(target_idx)
         save_group_state(chat_id)
