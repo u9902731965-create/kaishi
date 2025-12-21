@@ -467,7 +467,6 @@ def render_group_summary(chat_id: int) -> str:
         lines.append(f"{ts} {usdt}{_render_line_peer(r)}")
     lines.append("")
 
-    lines.append(f"清空时间（北京时间）：{reset_time}（账期 24 小时）")
     lines.append(f"当前费率： 入 {fmt_rate_percent(rin)} ⇄ 出 {fmt_rate_percent(abs(rout))}")
     lines.append(f"固定汇率： 入 {fin} ⇄ 出 {fout}")
     lines.append(f"应下发：{fmt_usdt(totals['should'])}")
